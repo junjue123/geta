@@ -226,10 +226,11 @@ def adjust_importance_criteria(param_group, bit_layers, full_precision=32, histo
         #           f"CV_Factor: {stability_factor:.2f} | Bit_Factor: {bit_factor:.1f} -> Adj: {adjusted_score.mean():.2e}")
 
 
-def calculate_importance_score(criteria, param_group, bit_layers=None, step=None):
+def calculate_importance_score(criteria, param_group, bit_layers=None, step=None, smooth_factor=0.8):
     """
     Args:
         step (int, optional): 当前训练步数
+        smooth_factor (float): 校准因子混合比例，默认 0.8
     """
     param_group['importance_scores'] = dict()
     with torch.no_grad():
@@ -254,14 +255,15 @@ def calculate_importance_score(criteria, param_group, bit_layers=None, step=None
 
     # 3. [新增] 根据方差和位宽调整分数
     # 这一步会修改 param_group['importance_scores'] 的值供优化器使用
-    adjust_importance_criteria(param_group, bit_layers)
+    adjust_importance_criteria(param_group, bit_layers, smooth_factor=smooth_factor)
 
 
-def calculate_importance_score_lora(criteria, param_group, global_params, bit_layers=None, step=None):
+def calculate_importance_score_lora(criteria, param_group, global_params, bit_layers=None, step=None, smooth_factor=0.8):
     """
     Args:
         step (int, optional): 当前训练步数
         bit_layers: (新增参数) 传入位宽字典
+        smooth_factor (float): 校准因子混合比例，默认 0.8
     """
     param_group['importance_scores'] = dict()
     with torch.no_grad():
@@ -282,4 +284,4 @@ def calculate_importance_score_lora(criteria, param_group, global_params, bit_la
     _record_and_plot(param_group, step=step)
 
     # 3. [新增] 根据方差和位宽调整分数
-    adjust_importance_criteria(param_group, bit_layers)
+    adjust_importance_criteria(param_group, bit_layers, smooth_factor=smooth_factor)

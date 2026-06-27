@@ -285,10 +285,6 @@ class MyGETA(BaseHybridSparseOptimizer):
 
             return is_quantize, quantized_weight
 
-    import torch
-    import numpy as np
-    import os
-
     def compute_gamma_d(self, param_group, active_redundant_idxes, bit_range):
         t_quant = None
         qm_list = []
@@ -882,6 +878,7 @@ class MyGETA(BaseHybridSparseOptimizer):
 
                 self.curr_pruning_period += 1
 
+        t = 0  # 默认值，防止 pruning_period_duration==0 时未定义
         if self.pruning_period_duration != 0:
             t = (self.num_steps - self.start_pruning_step) % self.pruning_period_duration
 
@@ -910,7 +907,8 @@ class MyGETA(BaseHybridSparseOptimizer):
                 # 步骤 1: 更新量化控制参数并加噪
                 for p_name, p in zip(group["p_names"], group["params"]):
                     if p_name in group["grad_variant"] and ("t_quant_wt" in p_name or "q_m_wt" in p_name):
-                        noise = self._get_cosine_noise(p, group['lr'], t_val, T_duration)
+                        # 量化参数使用 lr_quant 缩放噪声，并额外缩小 0.1 倍（对齐 geta.py 行为）
+                        noise = self._get_cosine_noise(p, group['lr_quant'], t_val, T_duration) * 0.1
                         p.data.add_(group["grad_variant"][p_name], alpha=-group["lr_quant"])
                         p.data.add_(noise)
 
@@ -1113,6 +1111,10 @@ class MyGETA(BaseHybridSparseOptimizer):
             self.logger.info(f"Pruning budget updated: period {period}, {old} → {num_groups_to_prune}")
 
         if period >= len(self.active_num_redundant_groups):
+            # 填充中间空位（默认预算为 0，表示不剪枝）
+            while len(self.active_num_redundant_groups) < period:
+                self.active_num_redundant_groups.append(0)
+                self.logger.info(f"Pruning budget: period {len(self.active_num_redundant_groups) - 1} filled with 0")
             self.active_num_redundant_groups.append(num_groups_to_prune)
             self.logger.info(f"Pruning budget updated: period {period}, {num_groups_to_prune}")
 

@@ -36,6 +36,9 @@ class TestMCSS:
         from only_train_once.optimizer.importance_score import (
             _apply_online_normalization, _GLOBAL_SCORE_BOUNDS
         )
+        # 清理全局状态，确保测试隔离
+        _GLOBAL_SCORE_BOUNDS.clear()
+
         # 模拟 param_group
         score_tensor = torch.tensor([0.1, 0.5, 1.0, 2.0, 5.0])
         param_group = {
@@ -96,12 +99,16 @@ class TestMCSS:
     def test_stability_factor(self):
         """验证稳定性因子 Ψ = exp(-CV) 的行为"""
         from only_train_once.optimizer.importance_score import (
-            adjust_importance_criteria, _SCORE_HISTORY
+            adjust_importance_criteria, _SCORE_HISTORY, _get_layer_name
         )
         import numpy as np
 
-        # 预设历史数据
-        layer_name = 'test_stability.weight'
+        # 预设历史数据 - key 必须与 _get_layer_name 输出一致
+        param_group = {
+            'importance_scores': {'magnitude': torch.ones(10)},
+            'p_names': ['test_stability.weight'],
+        }
+        layer_name = _get_layer_name(param_group)  # = 'test_stability'
         _SCORE_HISTORY.clear()
         _SCORE_HISTORY[layer_name] = {
             'steps': [1, 2, 3, 4, 5],
@@ -109,10 +116,7 @@ class TestMCSS:
         }
 
         score = torch.ones(10)
-        param_group = {
-            'importance_scores': {'magnitude': score.clone()},
-            'p_names': ['test_stability.weight'],
-        }
+        param_group['importance_scores'] = {'magnitude': score.clone()}
         bit_layers = {}  # 无位宽影响，bit_factor=1.0
 
         adjust_importance_criteria(param_group, bit_layers, smooth_factor=1.0)
@@ -271,17 +275,18 @@ class TestBugFixes:
         from only_train_once.optimizer.importance_score import (
             calculate_importance_score, _GLOBAL_SCORE_BOUNDS, _SCORE_HISTORY
         )
+        from only_train_once.transform import TensorTransform
 
         # 清理状态
         _GLOBAL_SCORE_BOUNDS.clear()
         _SCORE_HISTORY.clear()
 
-        # 模拟 param_group
+        # 模拟 param_group - 使用 TensorTransform.BASIC (值为 2)
         dummy_grad = torch.randn(8, 4)
         param_group = {
             'p_names': ['layer.weight'],
             'params': [torch.nn.Parameter(torch.randn(8, 4))],
-            'p_transform': [1],  # BASIC transform
+            'p_transform': [TensorTransform.BASIC],
             'num_groups': 8,
             'grad_variant': {'layer.weight': dummy_grad},
         }
