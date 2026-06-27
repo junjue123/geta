@@ -297,13 +297,13 @@ __global__ void {func_name}_kernel(
                 if (h_in >= 0 && h_in < height && w_in >= 0 && w_in < width) {{
                     // 获取输入值
                     int input_idx = ((b * in_channels + ic) * height + h_in) * width + w_in;
-                    float in_val = dequantize_{spec.activation_bit}(
+                    float in_val = dequantize_{self._get_quant_func_name(spec.activation_bit)}(
                         input[input_idx], input_scale, input_zero_point
                     );
 
                     // 获取权重值
                     int weight_idx = ((oc * in_channels + ic) * {spec.kernel_size} + kh) * {spec.kernel_size} + kw;
-                    float w_val = dequantize_{spec.weight_bit}(
+                    float w_val = dequantize_{self._get_quant_func_name(spec.weight_bit)}(
                         weight[weight_idx], weight_scale, weight_zero_point
                     );
 
@@ -402,13 +402,13 @@ __global__ void {func_name}_kernel(
     for (int if_idx = 0; if_idx < in_features; if_idx++) {{
         // 获取输入值
         int input_idx = b * in_features + if_idx;
-        float in_val = dequantize_{spec.activation_bit}(
+        float in_val = dequantize_{self._get_quant_func_name(spec.activation_bit)}(
             input[input_idx], input_scale, input_zero_point
         );
 
         // 获取权重值
         int weight_idx = of * in_features + if_idx;
-        float w_val = dequantize_{spec.weight_bit}(
+        float w_val = dequantize_{self._get_quant_func_name(spec.weight_bit)}(
             weight[weight_idx], weight_scale, weight_zero_point
         );
 
@@ -621,10 +621,8 @@ def _check_lib():
 
     def _get_weight_type(self, bit_width: int) -> str:
         """获取权重数据类型"""
-        if bit_width <= 4:
-            return "int8_t"  # INT4打包到INT8
-        elif bit_width <= 8:
-            return "int8_t"
+        if bit_width <= 8:
+            return "int8_t"  # INT4/INT8都用int8_t
         elif bit_width <= 16:
             return "half"
         else:
@@ -634,6 +632,24 @@ def _check_lib():
         """获取输入数据类型"""
         if bit_width <= 8:
             return "int8_t"
+        elif bit_width <= 16:
+            return "half"
+        else:
+            return "float"
+
+    def _get_quant_func_name(self, bit_width: int) -> str:
+        """获取量化函数名称
+
+        将位宽映射到支持的量化函数:
+        - 1-4 bit -> int4
+        - 5-8 bit -> int8
+        - 9-16 bit -> half
+        - 17-32 bit -> float
+        """
+        if bit_width <= 4:
+            return "int4"
+        elif bit_width <= 8:
+            return "int8"
         elif bit_width <= 16:
             return "half"
         else:
