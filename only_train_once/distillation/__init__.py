@@ -16,6 +16,12 @@ from .advanced_distiller import (
     AdapterDistiller,
     AdvancedDistiller,
 )
+from .pruning_aware_distiller import (
+    PruningAwareDistiller,
+    PruningAwareTeacherEnsemble,
+    PruningStageScheduler,
+    IntegratedPruningDistiller,
+)
 
 __all__ = [
     'TeacherEnsemble',
@@ -30,4 +36,8 @@ __all__ = [
     'SampleCurriculum',
     'AdapterDistiller',
     'AdvancedDistiller',
+    'PruningAwareDistiller',
+    'PruningAwareTeacherEnsemble',
+    'PruningStageScheduler',
+    'IntegratedPruningDistiller',
 ]
