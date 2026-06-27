@@ -1,35 +1,19 @@
 """
 蒸馏模块
-提供教师模型集合管理、软标签蒸馏、层输出分布对齐、权重特征对齐功能。
+提供4个核心类：
+1. TeacherEnsemble - 教师集合管理
+2. SoftLabelDistiller - 软标签蒸馏
+3. FeatureDistiller - 每层输出分布对齐
+4. WeightDistiller - 每层权重特征对齐
+5. Distiller - 统一蒸馏器（整合接口）
 """
 
-from .teacher_ensemble import TeacherEnsemble
-from .soft_label_distiller import SoftLabelDistiller
-from .feature_distiller import FeatureDistiller
-from .weight_distiller import WeightDistiller
-from .layer_wise_distiller import LayerWiseDistiller, ProgressiveLayerDistiller
-from .advanced_distiller import (
-    DynamicLayerWeighting,
-    AttentionDistiller,
-    TemperatureAnnealer,
-    SampleCurriculum,
-    AdapterDistiller,
-    AdvancedDistiller,
-)
-from .pruning_aware_distiller import (
-    PruningAwareDistiller,
-    PruningAwareTeacherEnsemble,
-    PruningStageScheduler,
-    IntegratedPruningDistiller,
-)
-from .optimized_distiller import (
-    OnlineDistiller,
-    SelfDistiller,
-    FeatureReweighter,
-    DistributionMatcher,
-    ArchitectureAwareDistiller,
-    CachedDistiller,
-    OptimizedDistiller,
+from .core import (
+    TeacherEnsemble,
+    SoftLabelDistiller,
+    FeatureDistiller,
+    WeightDistiller,
+    Distiller,
 )
 
 __all__ = [
@@ -37,23 +21,5 @@ __all__ = [
     'SoftLabelDistiller',
     'FeatureDistiller',
     'WeightDistiller',
-    'LayerWiseDistiller',
-    'ProgressiveLayerDistiller',
-    'DynamicLayerWeighting',
-    'AttentionDistiller',
-    'TemperatureAnnealer',
-    'SampleCurriculum',
-    'AdapterDistiller',
-    'AdvancedDistiller',
-    'PruningAwareDistiller',
-    'PruningAwareTeacherEnsemble',
-    'PruningStageScheduler',
-    'IntegratedPruningDistiller',
-    'OnlineDistiller',
-    'SelfDistiller',
-    'FeatureReweighter',
-    'DistributionMatcher',
-    'ArchitectureAwareDistiller',
-    'CachedDistiller',
-    'OptimizedDistiller',
+    'Distiller',
 ]
