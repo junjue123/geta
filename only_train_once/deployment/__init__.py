@@ -5,6 +5,7 @@
 核心组件：
 1. ModelInfo - 模型信息提取
 2. KernelSelector - 核函数选择器
+3. CUDAKernelGenerator - CUDA核函数生成器
 """
 
 from .model_info import (
@@ -18,6 +19,8 @@ from .model_info import (
 
 from .kernel_selector import KernelSelector
 
+from .cuda_generator import CUDAKernelGenerator, generate_kernels_from_config
+
 __all__ = [
     'ModelInfo',
     'LayerStructure',
@@ -26,4 +29,6 @@ __all__ = [
     'get_kernel_config_for_layer',
     'export_kernel_config',
     'KernelSelector',
+    'CUDAKernelGenerator',
+    'generate_kernels_from_config',
 ]
