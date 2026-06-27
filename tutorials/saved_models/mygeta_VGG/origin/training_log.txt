@@ -1,0 +1,7 @@
+[2026-01-15 21:17:22] Ep: 0, total_loss: 1.9231, norm_all: 1487.24, grp_sparsity: 0.00, acc1: 39.3000, norm_import: 1487.24, norm_redund: 0.00, num_grp_import: 448, num_grp_redund: 0
+[2026-01-15 21:21:22] Ep: 1, total_loss: 1.4678, norm_all: 1434.01, grp_sparsity: 0.00, acc1: 37.1800, norm_import: 1434.01, norm_redund: 0.00, num_grp_import: 448, num_grp_redund: 0
+[2026-01-15 21:23:21] Ep: 2, total_loss: 1.2803, norm_all: 1451.67, grp_sparsity: 0.00, acc1: 43.5000, norm_import: 1451.67, norm_redund: 0.00, num_grp_import: 448, num_grp_redund: 0
+[2026-01-15 21:24:58] Ep: 3, total_loss: 1.2223, norm_all: 1352.91, grp_sparsity: 0.00, acc1: 47.5600, norm_import: 1352.91, norm_redund: 0.00, num_grp_import: 448, num_grp_redund: 0
+[2026-01-15 21:26:36] Ep: 4, total_loss: 1.2012, norm_all: 1274.82, grp_sparsity: 0.00, acc1: 43.8100, norm_import: 1274.82, norm_redund: 0.00, num_grp_import: 448, num_grp_redund: 0
+[2026-01-15 21:28:17] Ep: 5, total_loss: 1.1881, norm_all: 1135.61, grp_sparsity: 0.01, acc1: 37.4500, norm_import: 1135.61, norm_redund: 0.00, num_grp_import: 444, num_grp_redund: 4
+[2026-01-15 21:29:59] Ep: 6, total_loss: 1.1897, norm_all: 1082.97, grp_sparsity: 0.02, acc1: 49.2700, norm_import: 1082.97, norm_redund: 0.00, num_grp_import: 440, num_grp_redund: 8

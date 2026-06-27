@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# PyCharm / IDE
+.idea/
+.vscode/
+*.iml
+
+# pytest
+.pytest_cache/
+
+# Model weights / checkpoints / data
+cache/
+outputs/
+datasets/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.gz
+*.tar
+*.zip
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# WorkBuddy workspace
+.workbuddy/
