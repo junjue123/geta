@@ -179,6 +179,68 @@ class TeacherEnsemble:
             count += 1
         return count
 
+    def get_weighted_logits(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits_list: List[torch.Tensor]
+    ) -> torch.Tensor:
+        """根据教师置信度加权平均logits
+
+        置信度越高（max probability越大）的教师权重越大。
+
+        Args:
+            student_logits: 学生logits [B, C]
+            teacher_logits_list: 教师logits列表
+
+        Returns:
+            加权平均后的logits [B, C]
+        """
+        if not teacher_logits_list:
+            return student_logits
+
+        # 计算每个教师的置信度
+        confidences = []
+        for t_logits in teacher_logits_list:
+            probs = F.softmax(t_logits, dim=-1)
+            conf = probs.max(dim=-1)[0].mean()  # 平均最大概率
+            confidences.append(conf)
+
+        # 归一化权重
+        conf_tensor = torch.stack(confidences)
+        weights = F.softmax(conf_tensor, dim=0)
+
+        # 加权平均
+        weighted_logits = torch.zeros_like(teacher_logits_list[0])
+        for w, t_logits in zip(weights, teacher_logits_list):
+            weighted_logits += w * t_logits
+
+        return weighted_logits
+
+    def get_ensemble_state_dict(self, model: nn.Module) -> Dict[str, torch.Tensor]:
+        """获取所有教师的集成状态（平均权重）
+
+        Args:
+            model: 学生模型（用于获取结构）
+
+        Returns:
+            平均后的state_dict
+        """
+        teachers = self.get_teachers()
+        if not teachers:
+            return model.state_dict()
+
+        # 收集所有state_dict
+        all_state_dicts = [t['state_dict'] for t in teachers]
+
+        # 计算平均
+        avg_state_dict = {}
+        for key in all_state_dicts[0].keys():
+            values = [sd[key].float() for sd in all_state_dicts if key in sd]
+            if values:
+                avg_state_dict[key] = torch.stack(values).mean(dim=0)
+
+        return avg_state_dict
+
 
 # ============================================================================
 # 2. 软标签蒸馏
@@ -267,6 +329,82 @@ class SoftLabelDistiller:
         progress = epoch / max(max_epoch - 1, 1)
         temp = 2.0 + 0.5 * (self.temperature - 2.0) * (1 + math.cos(math.pi * progress))
         return max(temp, 2.0)
+
+    def compute_confidence_weights(
+        self,
+        teacher_logits_list: List[torch.Tensor]
+    ) -> List[float]:
+        """根据教师置信度计算权重
+
+        置信度越高（熵越低）的教师权重越大。
+
+        Args:
+            teacher_logits_list: 教师logits列表
+
+        Returns:
+            权重列表
+        """
+        if not teacher_logits_list:
+            return []
+
+        entropies = []
+        for t_logits in teacher_logits_list:
+            probs = F.softmax(t_logits, dim=-1)
+            # 计算熵（越低越自信）
+            entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
+            entropies.append(entropy.item())
+
+        # 熵越低权重越大
+        inv_entropies = [1.0 / (e + 1e-8) for e in entropies]
+        total = sum(inv_entropies)
+        weights = [ie / total for ie in inv_entropies]
+
+        return weights
+
+    def compute_loss_weighted(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits_list: List[torch.Tensor],
+        labels: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """计算加权软标签蒸馏loss
+
+        使用教师置信度作为权重。
+
+        Args:
+            student_logits: 学生logits
+            teacher_logits_list: 教师logits列表
+            labels: 真实标签
+
+        Returns:
+            加权蒸馏loss
+        """
+        if not teacher_logits_list:
+            return torch.tensor(0.0, device=student_logits.device)
+
+        weights = self.compute_confidence_weights(teacher_logits_list)
+        T = self.temperature
+
+        kd_losses = []
+        for w, teacher_logits in zip(weights, teacher_logits_list):
+            if self.mode == 'forward':
+                student_log = F.log_softmax(student_logits / T, dim=-1)
+                teacher_soft = F.softmax(teacher_logits / T, dim=-1)
+                kd = F.kl_div(student_log, teacher_soft, reduction='batchmean')
+            else:
+                teacher_log = F.log_softmax(teacher_logits / T, dim=-1)
+                student_soft = F.softmax(student_logits / T, dim=-1)
+                kd = F.kl_div(teacher_log, student_soft, reduction='batchmean')
+
+            kd_losses.append(w * kd)
+
+        kd_loss = torch.stack(kd_losses).sum() * (T ** 2)
+
+        if labels is not None:
+            ce_loss = F.cross_entropy(student_logits, labels)
+            return self.alpha * kd_loss + (1 - self.alpha) * ce_loss
+
+        return kd_loss
 
 
 # ============================================================================
@@ -542,6 +680,157 @@ class FeatureDistiller:
             params.extend(proj.parameters())
         return params
 
+    def compute_attention_map(self, features: torch.Tensor) -> torch.Tensor:
+        """计算特征图的注意力图
+
+        Args:
+            features: 特征图 [B, C, H, W] 或 [B, C]
+
+        Returns:
+            注意力权重 [B, 1, H, W] 或 [B, 1]
+        """
+        if features.dim() == 4:
+            # 空间注意力：通道平均
+            attention = features.abs().mean(dim=1, keepdim=True)
+        elif features.dim() == 3:
+            attention = features.abs().mean(dim=1, keepdim=True)
+        else:
+            attention = features.abs().mean(dim=1, keepdim=True)
+
+        # 归一化到 [0, 1]
+        min_val = attention.min()
+        max_val = attention.max()
+        if max_val - min_val > 1e-8:
+            attention = (attention - min_val) / (max_val - min_val)
+
+        return attention
+
+    def compute_loss_attention_weighted(
+        self,
+        student_model: nn.Module,
+        teacher_model: nn.Module,
+        x: torch.Tensor,
+        epoch: int = 0,
+        max_epoch: int = 100,
+        layer_names: Optional[List[str]] = None
+    ) -> torch.Tensor:
+        """计算注意力加权的特征对齐loss
+
+        使用教师的注意力图加权，重要区域权重更大。
+
+        Args:
+            student_model: 学生模型
+            teacher_model: 教师模型
+            x: 输入数据
+            epoch: 当前epoch
+            max_epoch: 总epoch
+            layer_names: 要对齐的层名称
+
+        Returns:
+            注意力加权的特征对齐loss
+        """
+        if layer_names is None:
+            layer_names = self._auto_select_layers(student_model, teacher_model)
+
+        active_layers = self._get_progressive_layers(layer_names, epoch, max_epoch)
+        self.register_hooks(student_model, teacher_model, active_layers)
+
+        with torch.no_grad():
+            teacher_model(x)
+        student_model(x)
+
+        losses = []
+        total_layers = len(active_layers)
+
+        for idx, layer_name in enumerate(active_layers):
+            if layer_name not in self._student_features or \
+               layer_name not in self._teacher_features:
+                continue
+
+            s_feat = self._student_features[layer_name]
+            t_feat = self._teacher_features[layer_name]
+
+            if s_feat.shape != t_feat.shape:
+                continue
+
+            # 计算注意力图（使用教师）
+            attention = self.compute_attention_map(t_feat)
+
+            # 加权
+            s_weighted = s_feat * attention
+            t_weighted = t_feat * attention
+
+            # 展平
+            if s_weighted.dim() > 2:
+                s_flat = s_weighted.flatten(start_dim=2).mean(dim=2)
+                t_flat = t_weighted.flatten(start_dim=2).mean(dim=2)
+            else:
+                s_flat = s_weighted
+                t_flat = t_weighted
+
+            # 归一化
+            s_norm = F.normalize(s_flat, dim=-1)
+            t_norm = F.normalize(t_flat, dim=-1)
+
+            # MSE对齐
+            loss = F.mse_loss(s_norm, t_norm)
+            losses.append(loss)
+
+        self.remove_hooks()
+
+        if not losses:
+            return torch.tensor(0.0)
+
+        return torch.stack(losses).mean() * self.weight
+
+    def get_layer_statistics(
+        self,
+        model: nn.Module,
+        x: torch.Tensor
+    ) -> Dict[str, Dict[str, float]]:
+        """获取各层特征统计信息
+
+        Args:
+            model: 模型
+            x: 输入数据
+
+        Returns:
+            统计信息字典
+        """
+        features = {}
+        hooks = []
+
+        def make_hook(name):
+            def hook(module, input, output):
+                features[name] = output
+            return hook
+
+        # 注册钩子
+        for name, module in model.named_modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                hooks.append(module.register_forward_hook(make_hook(name)))
+
+        # 前向传播
+        with torch.no_grad():
+            model(x)
+
+        # 清理钩子
+        for h in hooks:
+            h.remove()
+
+        # 计算统计信息
+        stats = {}
+        for name, feat in features.items():
+            stats[name] = {
+                'mean': feat.mean().item(),
+                'std': feat.std().item(),
+                'min': feat.min().item(),
+                'max': feat.max().item(),
+                'shape': list(feat.shape),
+            }
+
+        return stats
+
 
 # ============================================================================
 # 4. 每层权重特征对齐
@@ -691,6 +980,135 @@ class WeightDistiller:
                         'num_sv': len(sv)
                     }
         return stats
+
+    def compute_frobenius_loss(
+        self,
+        student_model: nn.Module,
+        teacher_model: nn.Module
+    ) -> torch.Tensor:
+        """计算Frobenius范数对齐loss
+
+        直接对齐权重矩阵的Frobenius范数，计算量更小。
+
+        Args:
+            student_model: 学生模型
+            teacher_model: 教师模型
+
+        Returns:
+            Frobenius范数对齐loss
+        """
+        student_weights = {}
+        teacher_weights = {}
+
+        for name, module in student_model.named_modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                student_weights[name] = module.weight
+
+        for name, module in teacher_model.named_modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                teacher_weights[name] = module.weight
+
+        losses = []
+        common_layers = set(student_weights.keys()) & set(teacher_weights.keys())
+
+        for layer_name in common_layers:
+            s_weight = student_weights[layer_name]
+            t_weight = teacher_weights[layer_name]
+
+            if s_weight.shape != t_weight.shape:
+                continue
+
+            # Frobenius范数
+            s_norm = torch.norm(s_weight, p='fro')
+            t_norm = torch.norm(t_weight, p='fro')
+
+            loss = F.mse_loss(s_norm, t_norm)
+            losses.append(loss)
+
+        if not losses:
+            return torch.tensor(0.0)
+
+        return torch.stack(losses).mean() * self.weight
+
+    def compute_distribution_loss(
+        self,
+        student_model: nn.Module,
+        teacher_model: nn.Module
+    ) -> torch.Tensor:
+        """计算权重分布对齐loss
+
+        对齐权重的均值和方差。
+
+        Args:
+            student_model: 学生模型
+            teacher_model: 教师模型
+
+        Returns:
+            分布对齐loss
+        """
+        student_weights = {}
+        teacher_weights = {}
+
+        for name, module in student_model.named_modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                student_weights[name] = module.weight
+
+        for name, module in teacher_model.named_modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                teacher_weights[name] = module.weight
+
+        losses = []
+        common_layers = set(student_weights.keys()) & set(teacher_weights.keys())
+
+        for layer_name in common_layers:
+            s_weight = student_weights[layer_name]
+            t_weight = teacher_weights[layer_name]
+
+            if s_weight.shape != t_weight.shape:
+                continue
+
+            # 均值对齐
+            mean_loss = F.mse_loss(s_weight.mean(), t_weight.mean())
+
+            # 方差对齐
+            var_loss = F.mse_loss(s_weight.var(), t_weight.var())
+
+            losses.append(mean_loss + var_loss)
+
+        if not losses:
+            return torch.tensor(0.0)
+
+        return torch.stack(losses).mean() * self.weight
+
+    def compute_loss_combined(
+        self,
+        student_model: nn.Module,
+        teacher_model: nn.Module,
+        svd_weight: float = 0.5,
+        frobenius_weight: float = 0.3,
+        distribution_weight: float = 0.2
+    ) -> torch.Tensor:
+        """计算组合权重对齐loss
+
+        结合SVD、Frobenius范数和分布对齐。
+
+        Args:
+            student_model: 学生模型
+            teacher_model: 教师模型
+            svd_weight: SVD loss权重
+            frobenius_weight: Frobenius loss权重
+            distribution_weight: 分布loss权重
+
+        Returns:
+            组合loss
+        """
+        svd_loss = self.compute_loss(student_model, teacher_model)
+        frobenius_loss = self.compute_frobenius_loss(student_model, teacher_model)
+        dist_loss = self.compute_distribution_loss(student_model, teacher_model)
+
+        return (svd_weight * svd_loss +
+                frobenius_weight * frobenius_loss +
+                distribution_weight * dist_loss)
 
 
 # ============================================================================
