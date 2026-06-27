@@ -22,6 +22,15 @@ from .pruning_aware_distiller import (
     PruningStageScheduler,
     IntegratedPruningDistiller,
 )
+from .optimized_distiller import (
+    OnlineDistiller,
+    SelfDistiller,
+    FeatureReweighter,
+    DistributionMatcher,
+    ArchitectureAwareDistiller,
+    CachedDistiller,
+    OptimizedDistiller,
+)
 
 __all__ = [
     'TeacherEnsemble',
@@ -40,4 +49,11 @@ __all__ = [
     'PruningAwareTeacherEnsemble',
     'PruningStageScheduler',
     'IntegratedPruningDistiller',
+    'OnlineDistiller',
+    'SelfDistiller',
+    'FeatureReweighter',
+    'DistributionMatcher',
+    'ArchitectureAwareDistiller',
+    'CachedDistiller',
+    'OptimizedDistiller',
 ]
