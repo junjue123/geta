@@ -17,7 +17,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
-from only_train_once.optimizer.geta_b import MyGETA
+from only_train_once.optimizer.mygeta import MyGETA
 from only_train_once.transform import TensorTransform
 
 

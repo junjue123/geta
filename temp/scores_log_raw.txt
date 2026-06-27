@@ -1266,3 +1266,17 @@ Step: 36 | Layer: layer0
   - taylor_first_order: 7.521011e+00
   - taylor_second_order: 4.169003e+01
 ------------------------------
+Step: 1 | Layer: layer0
+  - magnitude: 2.994587e+00
+  - avg_magnitude: 3.743234e-01
+  - cosine_similarity: 9.287833e-01
+  - taylor_first_order: 1.208402e+01
+  - taylor_second_order: 1.269574e+02
+------------------------------
+Step: 2 | Layer: layer1
+  - magnitude: 2.641908e+00
+  - avg_magnitude: 3.302384e-01
+  - cosine_similarity: 9.069082e-01
+  - taylor_first_order: 9.378725e+00
+  - taylor_second_order: 7.135468e+01
+------------------------------

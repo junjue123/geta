@@ -37,12 +37,12 @@ print("\n" + "=" * 60)
 print("2. 验证 safe_open_file 修复（P0 bug 修复）")
 print("=" * 60)
 
-geta_b_path = os.path.join(
+mygeta_path = os.path.join(
     os.path.dirname(__file__), '..', '..',
-    'only_train_once', 'optimizer', 'geta_b.py'
+    'only_train_once', 'optimizer', 'mygeta.py'
 )
-with open(geta_b_path, 'r', encoding='utf-8') as f:
-    geta_b_content = f.read()
+with open(mygeta_path, 'r', encoding='utf-8') as f:
+    mygeta_content = f.read()
 
 geta_path = os.path.join(
     os.path.dirname(__file__), '..', '..',
@@ -52,15 +52,15 @@ with open(geta_path, 'r', encoding='utf-8') as f:
     geta_content = f.read()
 
 # 验证 file = None 初始化
-assert 'file = None' in geta_b_content, \
-    "错误: geta_b.py safe_open_file 中缺少 file = None 初始化"
-assert 'if file is not None:' in geta_b_content, \
-    "错误: geta_b.py safe_open_file 中缺少 file is not None 检查"
+assert 'file = None' in mygeta_content, \
+    "错误: mygeta.py safe_open_file 中缺少 file = None 初始化"
+assert 'if file is not None:' in mygeta_content, \
+    "错误: mygeta.py safe_open_file 中缺少 file is not None 检查"
 assert 'file = None' in geta_content, \
     "错误: geta.py safe_open_file 中缺少 file = None 初始化"
 assert 'if file is not None:' in geta_content, \
     "错误: geta.py safe_open_file 中缺少 file is not None 检查"
-print("  [PASS] geta_b.py 和 geta.py 的 safe_open_file 均已修复")
+print("  [PASS] mygeta.py 和 geta.py 的 safe_open_file 均已修复")
 
 # ============================================================================
 # 3. 验证 smooth_factor 调整（P2 修复）
@@ -337,7 +337,7 @@ print("=" * 60)
 print()
 print("修复总结:")
 print("  [P0] _GLOBAL_SCORE_BOUNDS 初始化 → 已修复")
-print("  [P0] safe_open_file 上下文管理器 → 已修复 (geta.py + geta_b.py)")
+print("  [P0] safe_open_file 上下文管理器 → 已修复 (geta.py + mygeta.py)")
 print("  [P2] smooth_factor 0.2 → 0.8 → 对齐 MCSS 论文公式")
 print()
 print("模块验证:")

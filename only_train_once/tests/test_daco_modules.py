@@ -145,7 +145,7 @@ class TestDGD:
 
     def test_cosine_noise_shape_and_device(self):
         """验证 _get_cosine_noise 输出形状和设备与输入一致"""
-        from only_train_once.optimizer.geta_b import MyGETA
+        from only_train_once.optimizer.mygeta import MyGETA
 
         # 模拟优化器实例（最小化初始化）
         dummy_param = torch.randn(64, 32)
@@ -166,7 +166,7 @@ class TestDGD:
 
     def test_cosine_noise_decay(self):
         """验证噪声按余弦调度从最大值衰减到 0"""
-        from only_train_once.optimizer.geta_b import MyGETA
+        from only_train_once.optimizer.mygeta import MyGETA
 
         dummy_param = torch.ones(1000, 1000)  # 大张量确保统计稳定
         lr = 0.1
@@ -194,7 +194,7 @@ class TestDGD:
 
     def test_cosine_noise_zero_at_end(self):
         """验证噪声在 t=T 时接近零"""
-        from only_train_once.optimizer.geta_b import MyGETA
+        from only_train_once.optimizer.mygeta import MyGETA
 
         dummy_param = torch.randn(100, 100)
         lr = 1.0
@@ -209,7 +209,7 @@ class TestDGD:
 
     def test_noise_independence(self):
         """验证每次噪声生成是独立的（不同种子）"""
-        from only_train_once.optimizer.geta_b import MyGETA
+        from only_train_once.optimizer.mygeta import MyGETA
 
         param = torch.zeros(1000)
         lr, T = 0.01, 5
@@ -233,7 +233,7 @@ class TestBugFixes:
 
     def test_safe_open_file_handles_error(self):
         """验证 safe_open_file 在文件打开失败时不崩溃"""
-        from only_train_once.optimizer.geta_b import MyGETA
+        from only_train_once.optimizer.mygeta import MyGETA
 
         # 创建一个无法写入的路径
         import tempfile
@@ -252,7 +252,7 @@ class TestBugFixes:
 
     def test_safe_open_file_normal(self):
         """验证 safe_open_file 在正常情况下正常工作"""
-        from only_train_once.optimizer.geta_b import MyGETA
+        from only_train_once.optimizer.mygeta import MyGETA
 
         import tempfile
         with tempfile.TemporaryDirectory() as tmpdir:

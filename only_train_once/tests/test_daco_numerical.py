@@ -29,7 +29,7 @@ class TestDiffusionNumerical:
 
     def test_cosine_noise_no_nan_inf(self):
         """验证噪声在各种输入下不会产生 NaN/Inf"""
-        from only_train_once.optimizer.geta_b import MyGETA
+        from only_train_once.optimizer.mygeta import MyGETA
 
         test_cases = [
             # (lr, t, T, description)
@@ -53,7 +53,7 @@ class TestDiffusionNumerical:
 
     def test_cosine_noise_boundary_t_equals_T(self):
         """验证 t=T 时噪声严格为 0"""
-        from only_train_once.optimizer.geta_b import MyGETA
+        from only_train_once.optimizer.mygeta import MyGETA
 
         param = torch.randn(50, 50)
         noise = MyGETA._get_cosine_noise(MyGETA, param, 0.1, T=20, t=20)
@@ -65,7 +65,7 @@ class TestDiffusionNumerical:
 
     def test_cosine_noise_boundary_t_equals_1(self):
         """验证 t=1 时噪声最大"""
-        from only_train_once.optimizer.geta_b import MyGETA
+        from only_train_once.optimizer.mygeta import MyGETA
 
         param = torch.randn(1000, 1000)
         lr = 0.1
@@ -81,7 +81,7 @@ class TestDiffusionNumerical:
 
     def test_cosine_noise_formula_correctness(self):
         """验证噪声公式: scale = lr * sqrt(1 - cos((T-t)*pi/(T-1)))"""
-        from only_train_once.optimizer.geta_b import MyGETA
+        from only_train_once.optimizer.mygeta import MyGETA
 
         param = torch.ones(10000, 10000)  # 大张量
         lr = 0.5
@@ -304,7 +304,7 @@ class TestAdaptiveBitReduction:
 
     def test_adaptive_bit_reduction_no_layers(self):
         """验证无层时不崩溃"""
-        from only_train_once.optimizer.geta_b import MyGETA
+        from only_train_once.optimizer.mygeta import MyGETA
 
         # 创建最小化 mock
         class MockOptimizer:
@@ -322,7 +322,7 @@ class TestAdaptiveBitReduction:
 
     def test_adaptive_bit_reduction_threshold_0(self):
         """验证 threshold=0 时只要有层降位宽就触发"""
-        from only_train_once.optimizer.geta_b import MyGETA
+        from only_train_once.optimizer.mygeta import MyGETA
 
         class MockOptimizer:
             min_bit_wt = 4
@@ -347,7 +347,7 @@ class TestAdaptiveBitReduction:
 
     def test_adaptive_bit_reduction_threshold_1(self):
         """验证 threshold=1 时需要所有层都降位宽才触发"""
-        from only_train_once.optimizer.geta_b import MyGETA
+        from only_train_once.optimizer.mygeta import MyGETA
 
         call_count = 0
 
@@ -384,7 +384,7 @@ class TestAdaptiveBitReduction:
 
     def test_adaptive_bit_reduction_min_bound(self):
         """验证位宽不会降到 min_bit_wt 以下"""
-        from only_train_once.optimizer.geta_b import MyGETA
+        from only_train_once.optimizer.mygeta import MyGETA
 
         class MockOptimizer:
             min_bit_wt = 4
@@ -417,7 +417,7 @@ class TestPruningBudgetControl:
 
     def test_set_pruning_budget_extend_periods(self):
         """验证扩展周期数的正确性"""
-        from only_train_once.optimizer.geta_b import MyGETA
+        from only_train_once.optimizer.mygeta import MyGETA
 
         class MockOptimizer:
             total_num_groups = 1000
@@ -442,7 +442,7 @@ class TestPruningBudgetControl:
 
     def test_set_pruning_budget_current_period(self):
         """验证修改当前周期的预算"""
-        from only_train_once.optimizer.geta_b import MyGETA
+        from only_train_once.optimizer.mygeta import MyGETA
 
         class MockOptimizer:
             total_num_groups = 1000
@@ -461,7 +461,7 @@ class TestPruningBudgetControl:
 
     def test_set_pruning_budget_minimum_one(self):
         """验证预算至少为 1"""
-        from only_train_once.optimizer.geta_b import MyGETA
+        from only_train_once.optimizer.mygeta import MyGETA
 
         class MockOptimizer:
             total_num_groups = 100
