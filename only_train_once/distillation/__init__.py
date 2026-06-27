@@ -8,6 +8,14 @@ from .soft_label_distiller import SoftLabelDistiller
 from .feature_distiller import FeatureDistiller
 from .weight_distiller import WeightDistiller
 from .layer_wise_distiller import LayerWiseDistiller, ProgressiveLayerDistiller
+from .advanced_distiller import (
+    DynamicLayerWeighting,
+    AttentionDistiller,
+    TemperatureAnnealer,
+    SampleCurriculum,
+    AdapterDistiller,
+    AdvancedDistiller,
+)
 
 __all__ = [
     'TeacherEnsemble',
@@ -16,4 +24,10 @@ __all__ = [
     'WeightDistiller',
     'LayerWiseDistiller',
     'ProgressiveLayerDistiller',
+    'DynamicLayerWeighting',
+    'AttentionDistiller',
+    'TemperatureAnnealer',
+    'SampleCurriculum',
+    'AdapterDistiller',
+    'AdvancedDistiller',
 ]
