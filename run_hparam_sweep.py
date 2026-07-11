@@ -10,7 +10,8 @@ DACO 超参数实验脚本 (Hyperparameter Sweep for DACO)
   · RCAJS (Resource-Constrained Adaptive Joint Sparsity) 资源约束自适应调度
       可控超参: target_group_sparsity, pruning_periods, bit_reduction,
                 max_bit_wt, min_bit_wt
-      (注: phi_b_threshold 属于独立 RCAJSController 仿真类，未接入 GETA 主循环)
+      (注: RCAJS 的 β_p / φ_b 论文超参分析见 run_rcajs_hparam.py ——
+       二者在 GETA 优化器内已接线为 RCAJSController，但需外部扫描脚本驱动)
   · MCSS  (Multi-Criteria Calibrated Saliency Score)  多标准校准重要性分数
       可控超参: importance_score_criteria (代理权重), mcss_smooth_factor (κ),
                 mcss_history_window (W, 稳定性窗口)
@@ -130,8 +131,6 @@ SWEEP = {
         {"label": "maxbw=8",      "max_bit_wt": 8},
         {"label": "maxbw=32",     "max_bit_wt": 32},
         {"label": "minbw=4",      "min_bit_wt": 4},
-        # 注: phi_b_threshold 属于独立的 RCAJSController 仿真类，
-        #     未接入 GETA 训练主循环，故此处不扫 (详见 geta.py L34-52)。
     ],
     # ---------------------- MCSS ----------------------
     "mcss": [

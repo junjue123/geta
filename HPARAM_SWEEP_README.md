@@ -79,8 +79,9 @@ CUDA_VISIBLE_DEVICES="" python run_hparam_sweep.py --module all --out outputs/hp
 - `max_bit_wt`：权重最大位宽（8 / 16 / 32）
 - `min_bit_wt`：权重最小位宽（2 / 4）
 
-> 注：`phi_b_threshold` 属于独立的 `RCAJSController` 仿真类（见 `geta.py` L34-52），
-> 未接入 GETA 主训练循环，故本脚本不扫该参数。
+> 注：RCAJS 的 **β_p（阻尼系数）** 与 **φ_b（收缩比）** 论文超参分析见
+> 专用脚本 `run_rcajs_hparam.py`（GETA 优化器内部已接线 `RCAJSController`，
+> β_p 经 `opt.rcajs.beta_p` 生效、φ_b 由训练循环外部调度器驱动 `opt.max_bit_wt`）。
 
 ### 4.2 MCSS（多标准校准重要性分数）
 - `mcss_smooth_factor`：校准因子混合比例（0.5 / 0.8 / 1.0）
@@ -98,6 +99,44 @@ CUDA_VISIBLE_DEVICES="" python run_hparam_sweep.py --module all --out outputs/hp
 > `oto.geta()` 是固定签名 wrapper，不转发 DGD 超参；脚本在构造优化器后
 > 将这些参数作为属性注入（`opt.diffusion_noise_init` 等），由 GETA 的
 > `step()` 读取。
+
+---
+
+## 4.4 论文「Hyperparameter Analysis」专项：`run_rcajs_hparam.py`
+
+论文 Section IV「Hyperparameter Analysis」显式要求分析 **RCAJS 的 β_p 与 φ_b**
+两个超参的敏感性（对应论文 Fig. hyper_rcajs(a)/(b)）。本仓库的
+`run_rcajs_hparam.py` 专门补齐这两项此前欠缺的实验：
+
+| 论文超参 | 含义 | 取值扫描 | 生效方式 |
+|---|---|---|---|
+| **β_p** | 阻尼系数，经 `r_p = r_base·exp(-β_p·Δ_p)` 调节自适应剪枝率 | `0.01 / 0.05 / 0.1 / 0.3 / 0.5 / 1.0 / 2.0` | 构造后注入 `opt.rcajs.beta_p` |
+| **φ_b** | 收缩比阈值，低于 max_bit 的层比例超过阈值则触发一次位宽收缩（受 `min_bit_wt` 硬下界保护） | `0.1 / 0.3 / 0.5 / 0.7 / 0.9` | 训练循环外部门控调度器驱动 `opt.max_bit_wt` |
+
+### 启用方式
+
+```bash
+# (1) 跑全部 RCAJS 论文超参 (β_p + φ_b)
+CUDA_VISIBLE_DEVICES="" python run_rcajs_hparam.py
+
+# (2) 只扫 β_p (论文 Fig. hyper_rcajs(a))
+CUDA_VISIBLE_DEVICES="" python run_rcajs_hparam.py --mode beta
+
+# (3) 只扫 φ_b (论文 Fig. hyper_rcajs(b))
+CUDA_VISIBLE_DEVICES="" python run_rcajs_hparam.py --mode phi
+
+# (4) 快速冒烟 (β_p/φ_b 各取 3 个代表值)
+CUDA_VISIBLE_DEVICES="" python run_rcajs_hparam.py --quick
+
+# (5) 自定义步数 / 输出目录 / 跳过绘图
+CUDA_VISIBLE_DEVICES="" python run_rcajs_hparam.py --mode all --steps 20 \
+    --out outputs/rcajs_hparam --no-plot
+```
+
+### 说明
+- 单变量隔离：β_p / φ_b 均固定 `target_group_sparsity=0.5`，避免互相干扰（论文主实验默认 φ_b=0.9、b_ε=4、κ=0.1、W=5）。
+- 代理精度：随机数据下 `proxy_acc = 1/(1+final_loss)`，仅用于观察相对趋势；论文真实曲线需以 CIFAR-10 全量训练替换 `run_trial` 中的训练循环。
+- 输出：`rcajs_hparam_<mode>_<时间戳>.csv` / `.md`，以及 `plot_rcajs_beta.png`、`plot_rcajs_phi.png`、`plot_rcajs_phi_traj.png`。
 
 ---
 
@@ -157,6 +196,7 @@ CUDA_VISIBLE_DEVICES="" python run_hparam_sweep.py --module all --out outputs/hp
 ## 9. 相关文件
 
 - 主脚本：`run_hparam_sweep.py`
+- 论文超参专项：`run_rcajs_hparam.py`（RCAJS β_p / φ_b 敏感性分析）
 - 框架修复：`only_train_once/optimizer/geta.py`、`geta_b.py`、`graph/utils.py`、`graph/graph.py`、`optimizer/importance_score/__init__.py`
 - 模型：`sanity_check/backends/vgg7.py`
 - 验证用例：`only_train_once/tests/verify_daco_fixes.py`
