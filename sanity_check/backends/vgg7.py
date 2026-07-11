@@ -26,7 +26,8 @@ def _weights_init(m):
         nn.init.constant_(m.bias, 0)
 
 def _make_layers(vgg_cfg, batch_norm: bool = False):
-    layers = nn.Sequential()
+    # 【环境兼容】PyTorch < 1.9 没有 nn.Sequential.append()，改用列表方式
+    layers = []
     in_channels = 3
     for v in vgg_cfg:
         if v == "M":
@@ -41,9 +42,9 @@ def _make_layers(vgg_cfg, batch_norm: bool = False):
                 layers.append(nn.Conv2d(in_channels, v, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)))
                 layers.append(nn.ReLU(inplace=True))  # inplace operation
             in_channels = v
-    
+
     layers.append(nn.AdaptiveAvgPool2d(output_size=(1, 1)))
-    return layers
+    return nn.Sequential(*layers)
 
 
 class VGG7_BN(nn.Module):
@@ -72,6 +73,6 @@ class VGG7_BN(nn.Module):
         # out = torch.flatten(out, 1)
         out = self.classifier(out)
         return out
-    
+
 def vgg7_bn(cfg=None):
     return VGG7_BN(vgg_cfg=[128, 128, "M", 256, 256, "M", 512, 512, "M"], num_classes=10, batch_norm=True)

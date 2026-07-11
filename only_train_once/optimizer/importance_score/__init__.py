@@ -232,6 +232,15 @@ def calculate_importance_score(criteria, param_group, bit_layers=None, step=None
         step (int, optional): 当前训练步数
         smooth_factor (float): 校准因子混合比例，默认 0.8
     """
+    # --- [Bug Fix] 跨会话累积: step==0 或 step==1 时清理历史 ---
+    # 避免多次训练复用同一进程时数据累积导致 CV 计算错误
+    if step is not None and step <= 1:
+        layer_name = _get_layer_name(param_group)
+        if layer_name in _SCORE_HISTORY:
+            _SCORE_HISTORY[layer_name] = {'steps': []}
+        if layer_name in _GLOBAL_SCORE_BOUNDS:
+            del _GLOBAL_SCORE_BOUNDS[layer_name]
+
     param_group['importance_scores'] = dict()
     with torch.no_grad():
         # 1. 计算原始重要性分数

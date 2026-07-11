@@ -126,6 +126,9 @@ def extract_model_info(model: nn.Module, model_name: str = "") -> ModelInfo:
     Returns:
         模型信息
     """
+    # Ensure model_name is a plain string (avoid Tensor ambiguity)
+    if not isinstance(model_name, str):
+        model_name = str(model_name) if model_name else ""
     info = ModelInfo(
         model_name=model_name or type(model).__name__,
         total_params=sum(p.numel() for p in model.parameters()),

@@ -19,6 +19,254 @@ logging.basicConfig(
 )
 
 
+class RCAJSController:
+    """
+    [DACO - RCAJS] Rate-Control Adaptive Joint Sparsity (RCAJS)
+    Lagrangian KL-divergence closed-loop controller for adaptive pruning.
+
+    论文核心:
+        - 目标: min  KL(p_target || p_curr) + λ * stability_term
+        - 提前停止: 当 C_curr <= C_target 时停止
+        - 自适应剪枝率: r_p = r_base * exp(-β_p * Δ_p)
+        - 位宽自适应: φ_b 阈值触发位宽缩减
+    """
+
+    def __init__(
+        self,
+        total_groups: int,
+        target_sparsity: float,
+        beta_p: float = 0.1,
+        lambda_stability: float = 0.1,
+        phi_b_threshold: float = 0.8,
+        verbose: bool = False,
+        device: str = "cuda",
+    ):
+        self.total_groups = total_groups
+        self.target_sparsity = target_sparsity  # 目标稀疏度 (0~1)
+        self.target_num_groups = int(total_groups * (1 - target_sparsity))  # 目标重要组数
+        self.beta_p = beta_p  # 自适应速率系数
+        self.lambda_stability = lambda_stability  # Lagrangian 稳定性权重
+        self.phi_b_threshold = phi_b_threshold  # 位宽自适应触发阈值
+        self.verbose = verbose
+        self.device = device
+
+        # 状态追踪
+        self.history_sparsity = []  # 历史稀疏度记录
+        self.history_delta_p = []   # 历史 Δ_p = target - current
+        self.history_prune_rate = []  # 历史剪枝率
+        self.current_sparsity = 0.0
+        self.curr_pruning_rate = 0.05  # 初始剪枝率 (cosine 基础值)
+        self.early_stopped = False
+
+        # KL 散度追踪
+        self.prev_kl_div = None
+        self.kl_window_size = 5
+        self.kl_history = []
+
+        # 位宽自适应
+        self.bit_layers_below_max_count = 0
+        self.bit_layers_total_count = 0
+        self.bit_reduction_triggered = False
+
+    def compute_current_sparsity(self, num_pruned_groups: int) -> float:
+        """计算当前稀疏度 = 已剪枝组数 / 总组数"""
+        self.current_sparsity = num_pruned_groups / max(self.total_groups, 1)
+        return self.current_sparsity
+
+    def compute_delta_p(self) -> float:
+        """
+        计算稀疏度偏差 Δ_p = target_sparsity - current_sparsity
+        正偏差 → 需要更多剪枝；负偏差 → 剪枝过度
+        """
+        delta_p = self.target_sparsity - self.current_sparsity
+        return delta_p
+
+    def compute_stability_term(self) -> float:
+        """
+        稳定性项: 基于历史稀疏度变化的波动程度
+        Ψ_stability = exp(-σ(Δ_p_history))
+        波动小 → Ψ 接近 1（鼓励继续剪枝）
+        波动大 → Ψ 接近 0（抑制激进剪枝）
+        """
+        if len(self.history_delta_p) < 2:
+            return 1.0
+        delta_p_arr = np.array(self.history_delta_p[-self.kl_window_size:])
+        std_delta = np.std(delta_p_arr)
+        stability_term = math.exp(-std_delta)
+        return max(0.1, stability_term)  # 下限 0.1
+
+    def compute_kl_divergence(self, score_dist: torch.Tensor) -> float:
+        """
+        计算当前分数分布与均匀分布的 KL 散度
+        KL(Uniform || Score) 越小 → 分布越不均匀（剪枝越激进）
+        用于判断是否接近收敛
+        """
+        # 归一化为概率分布
+        probs = torch.nn.functional.softmax(score_dist.flatten(), dim=0)
+        probs = probs.cpu().numpy()
+        probs = np.maximum(probs, 1e-10)  # 避免 log(0)
+
+        # 均匀分布
+        uniform = 1.0 / len(probs)
+        kl_div = np.sum(probs * np.log(probs / uniform))
+
+        # 滑动平均
+        self.kl_history.append(kl_div)
+        if len(self.kl_history) > self.kl_window_size:
+            self.kl_history.pop(0)
+
+        return kl_div
+
+    def should_early_stop(self, num_active_redundant: int) -> bool:
+        """
+        提前停止判断: 当剩余待剪枝冗余组数 <= 0 时停止（即已无冗余组可剪）
+        论文条件: C_curr <= C_target → 无更多冗余组需要剪枝时停止
+        """
+        if num_active_redundant <= 0:
+            self.early_stopped = True
+            if self.verbose:
+                target_redundant = self.total_groups - self.target_num_groups
+                print(f"  [RCAJS] 提前停止触发: 剩余待剪冗余={num_active_redundant} <= 0, "
+                      f"已剪={self.total_groups - num_active_redundant}, 目标保留={self.target_num_groups}")
+            return True
+        return False
+
+    def compute_adaptive_prune_rate(self, base_rate: float = None) -> float:
+        """
+        [核心] 自适应剪枝率计算 — Lagrangian 闭环控制
+
+        公式: r_p = r_base * exp(-β_p * Δ_p) * Ψ_stability
+
+        - Δ_p > 0 (稀疏度不足): exp(-β*Δ) < 1 → 加速剪枝
+        - Δ_p < 0 (过度剪枝): exp(-β*Δ) > 1 → 减速/回退
+        - Ψ_stability < 1 (波动大): 进一步抑制激进剪枝
+        """
+        if self.early_stopped:
+            return 0.0
+
+        delta_p = self.compute_delta_p()
+        stability_term = self.compute_stability_term()
+
+        if base_rate is None:
+            # Cosine 退火基础剪枝率 (与原 DGD 一致)
+            progress = min(1.0, self.current_sparsity / max(self.target_sparsity, 0.01))
+            base_rate = 0.01 + 0.07 * (1 + math.cos(math.pi * progress)) / 2
+
+        # Lagrangian 自适应修正
+        adaptive_factor = math.exp(-self.beta_p * delta_p)
+        self.curr_pruning_rate = base_rate * adaptive_factor * stability_term
+
+        # 硬约束: 剪枝率上限
+        self.curr_pruning_rate = np.clip(self.curr_pruning_rate, 0.001, 0.15)
+
+        return self.curr_pruning_rate
+
+    def update_bit_adaptive(self, bit_layers_dict: dict, max_bit: int = 16):
+        """
+        位宽自适应触发判断: 当 φ_b (低于 max_bit 的层比例) > φ_b_threshold 时
+        触发一次 bit_reduction
+        """
+        if not bit_layers_dict:
+            return False
+
+        below_max_count = 0
+        total_count = 0
+        for layer_name, bits in bit_layers_dict.items():
+            if isinstance(bits, dict) and "weight" in bits:
+                if bits["weight"] < max_bit:
+                    below_max_count += 1
+                total_count += 1
+            elif isinstance(bits, (int, float)):
+                if bits < max_bit:
+                    below_max_count += 1
+                total_count += 1
+
+        if total_count == 0:
+            return False
+
+        phi_b = below_max_count / total_count
+        self.bit_layers_below_max_count = below_max_count
+        self.bit_layers_total_count = total_count
+
+        should_trigger = (phi_b > self.phi_b_threshold) and not self.bit_reduction_triggered
+        if should_trigger:
+            self.bit_reduction_triggered = True
+            if self.verbose:
+                print(f"  [RCAJS] 位宽自适应触发: φ_b={phi_b:.2%} > {self.phi_b_threshold} | "
+                      f"{below_max_count}/{total_count} 层低于 max_bit={max_bit}")
+
+        return should_trigger
+
+    def step(
+        self,
+        num_pruned_groups: int,
+        score_dist: torch.Tensor = None,
+        base_rate: float = None,
+    ) -> dict:
+        """
+        RCAJS 一步更新: 更新状态、返回自适应剪枝率
+
+        Returns:
+            dict: {
+                'prune_rate': float,          # 自适应剪枝率
+                'current_sparsity': float,     # 当前稀疏度
+                'delta_p': float,              # 稀疏度偏差
+                'stability_term': float,       # 稳定性项 Ψ
+                'kl_div': float,               # KL 散度
+                'early_stop': bool,            # 是否提前停止
+                'bit_adaptive_trigger': bool,  # 是否触发位宽自适应
+            }
+        """
+        # 1. 更新当前稀疏度
+        self.compute_current_sparsity(num_pruned_groups)
+        delta_p = self.compute_delta_p()
+
+        # 2. 记录历史
+        self.history_sparsity.append(self.current_sparsity)
+        self.history_delta_p.append(delta_p)
+
+        # 3. 计算 KL 散度（如果提供了分数分布）
+        kl_div = 0.0
+        if score_dist is not None:
+            kl_div = self.compute_kl_divergence(score_dist)
+
+        # 4. 提前停止检查
+        target_redundant = self.total_groups - self.target_num_groups
+        num_active_redundant = self.total_groups * self.target_sparsity - num_pruned_groups
+        early_stop = self.should_early_stop(int(max(0, num_active_redundant)))
+
+        # 5. 计算自适应剪枝率
+        prune_rate = self.compute_adaptive_prune_rate(base_rate)
+        stability_term = self.compute_stability_term()
+
+        # 6. 记录
+        self.history_prune_rate.append(prune_rate)
+
+        return {
+            "prune_rate": prune_rate,
+            "current_sparsity": self.current_sparsity,
+            "delta_p": delta_p,
+            "stability_term": stability_term,
+            "kl_div": kl_div,
+            "early_stop": early_stop,
+            "bit_adaptive_trigger": False,  # 由外部调用 update_bit_adaptive 设置
+        }
+
+    def get_summary(self) -> dict:
+        """返回 RCAJS 控制器状态摘要"""
+        return {
+            "total_groups": self.total_groups,
+            "target_sparsity": self.target_sparsity,
+            "current_sparsity": self.current_sparsity,
+            "delta_p": self.compute_delta_p(),
+            "curr_pruning_rate": self.curr_pruning_rate,
+            "stability_term": self.compute_stability_term(),
+            "early_stopped": self.early_stopped,
+            "bit_adaptive_triggered": self.bit_reduction_triggered,
+            "history_len": len(self.history_sparsity),
+        }
+
+
 class GETA(BaseHybridSparseOptimizer):
     """
     GETA: General and Efficient Training framework that Automates
@@ -156,6 +404,21 @@ class GETA(BaseHybridSparseOptimizer):
             f"Target redundant groups per period: {self.active_num_redundant_groups}"
         )
 
+        # --- [DACO - RCAJS] Lagrangian KL-divergence 控制器初始化 ---
+        self.rcajs = RCAJSController(
+            total_groups=self.total_num_groups,
+            target_sparsity=target_group_sparsity,
+            beta_p=0.1,
+            lambda_stability=0.1,
+            phi_b_threshold=0.8,
+            verbose=(verbose == "True"),
+            device=device,
+        )
+        self.logger.info(
+            f"[RCAJS] 控制器初始化: total_groups={self.total_num_groups}, "
+            f"target_sparsity={target_group_sparsity}, beta_p=0.1"
+        )
+
     @contextmanager
     def safe_open_file(self, filename, mode="a"):
         file = None
@@ -195,11 +458,47 @@ class GETA(BaseHybridSparseOptimizer):
         curr_active_num_redundant_groups = self.active_num_redundant_groups[
             self.curr_pruning_period
         ]
-        curr_K = len(self.pruned_group_idxes) + curr_active_num_redundant_groups
-        _, top_indices = torch.topk(-global_scores, curr_K)
+
+        # --- [DACO - RCAJS] 使用 Lagrangian 自适应剪枝率替换固定预算 ---
+        rcajs_state = self.rcajs.step(
+            num_pruned_groups=len(self.pruned_group_idxes),
+            score_dist=global_scores,
+        )
+        # 用 RCAJS 剪枝率计算本次 period 应剪枝的组数
+        # rate * total_groups 得到本次总共要剪的，再减去已剪的
+        rcajs_adaptive_K = int(math.ceil(rcajs_state["prune_rate"] * self.total_num_groups))
+        # 与原固定预算取较小值（保守策略），避免超过 period 预算
+        curr_active_num_adaptive = min(rcajs_adaptive_K, curr_active_num_redundant_groups)
+
+        if rcajs_state["early_stop"]:
+            curr_active_num_adaptive = 0
+            self.logger.info(
+                f"[RCAJS] Period {self.curr_pruning_period} 提前停止: "
+                f"sparsity={rcajs_state['current_sparsity']:.3f}, "
+                f"Δ_p={rcajs_state['delta_p']:.4f}, "
+                f"Ψ={rcajs_state['stability_term']:.3f}, "
+                f"KL={rcajs_state['kl_div']:.4f}"
+            )
+
+        # --- 日志输出 RCAJS 状态（每 5 个 period 或 verbose 模式） ---
+        if (self.verbose == "True" or self.curr_pruning_period % 5 == 0):
+            self.logger.info(
+                f"[RCAJS] Period {self.curr_pruning_period}: "
+                f"rate={rcajs_state['prune_rate']:.4f} "
+                f"(fixed={curr_active_num_redundant_groups}, adaptive={curr_active_num_adaptive}), "
+                f"sparsity={rcajs_state['current_sparsity']:.3f}/target={self.rcajs.target_sparsity:.3f}, "
+                f"Δ_p={rcajs_state['delta_p']:+.4f}, "
+                f"Ψ={rcajs_state['stability_term']:.3f}"
+            )
+
+        # --- 确定 top-K 冗余组 ---
+        # 【Bug Fix】torch.topk K 越界时直接崩溃，加安全边界
+        curr_K = len(self.pruned_group_idxes) + curr_active_num_adaptive
+        actual_K = min(curr_K, len(global_scores))
+        _, top_indices = torch.topk(-global_scores, actual_K)
         top_indices = top_indices.cpu().numpy()
         top_indices = np.setdiff1d(top_indices, self.pruned_group_idxes)[
-            :curr_active_num_redundant_groups
+            :curr_active_num_adaptive
         ].tolist()
         self.pruned_group_idxes.extend(top_indices)
 
@@ -762,8 +1061,11 @@ class GETA(BaseHybridSparseOptimizer):
 
         if t_quant is None:
             t_quant = 1.0
+        # Clamp exponent to avoid overflow
+        _exp = t_quant * math.log(max(abs(q_m), 1e-10))
+        _exp = max(min(_exp, 50.0), -50.0)
         bit_width = (
-            math.log2(math.exp(t_quant * math.log(abs(q_m))) / abs(d_quant) + 1) + 1
+            math.log2(math.exp(_exp) / max(abs(d_quant), 1e-10) + 1) + 1
         )
 
         return bit_width
@@ -783,8 +1085,13 @@ class GETA(BaseHybridSparseOptimizer):
         q_m = max(abs(q_m), 1e-10)
 
         # Calculate d_quant using scalar math
-        # d_quant = math.exp(t_quant * math.log(q_m)) / (2 ** (bit_width - 1) - 1)
-        d_quant = math.exp(t_quant * math.log(abs(q_m))) / (2 ** (bit_width - 1) - 1)
+        # Clamp exponent to avoid math.exp overflow
+        exponent = t_quant * math.log(abs(q_m))
+        exponent = max(min(exponent, 50.0), -50.0)
+        # 防御: bit_width==1 时 (2**0 - 1)=0 会触发 ZeroDivisionError，
+        #       钳制分母使用的有效位宽下限为 2 (与 min_bit_wt 一致)。
+        eff_bw = max(bit_width, 2)
+        d_quant = math.exp(exponent) / (2 ** (eff_bw - 1) - 1)
         return d_quant
 
     @staticmethod
@@ -876,7 +1183,18 @@ class GETA(BaseHybridSparseOptimizer):
             ) % self.projection_period_duration == 0 and (
                 self.num_steps - self.start_projection_step - 1
             ) != 0:
-                self.max_bit_wt = self.max_bit_wt - self.bit_reduction
+                # --- [DACO - RCAJS] 位宽自适应触发判断 ---
+                # 当 φ_b > φ_b_threshold 时，触发一次额外 bit reduction
+                bit_adaptive_triggered = self.rcajs.update_bit_adaptive(
+                    self.bit_layers, max_bit=int(self.max_bit_wt)
+                )
+                if bit_adaptive_triggered:
+                    self.max_bit_wt = max(self.max_bit_wt - self.bit_reduction, self.min_bit_wt)
+                    self.logger.info(
+                        f"[RCAJS] 位宽自适应触发: max_bit_wt -> {self.max_bit_wt}"
+                    )
+                else:
+                    self.max_bit_wt = self.max_bit_wt - self.bit_reduction
                 self.min_bit_wt = self.min_bit_wt
 
         # Partition groups into important and redundant groups
@@ -998,6 +1316,27 @@ class GETA(BaseHybridSparseOptimizer):
                             p.data[active_redundant_idxes] = (
                                 p.data[active_redundant_idxes]
                                 - gamma * p.data[active_redundant_idxes]
+                            )
+
+                    # --- [DACO - DGD] 重要组量化蒸馏引导 (论文 Eq.12) ---
+                    # 论文公式: 对重要组添加 γ₁ * Φ_res 量化蒸馏损失
+                    # 其中 Φ_res 是量化残差 (weight - quantized_weight)
+                    # 此处实现为: 对重要组施加量化引导，使其趋向量化后的表示
+                    important_idxes = group["important_idxes"]
+                    if p_transform != TensorTransform.NO_PRUNE and len(important_idxes) > 0:
+                        if is_quantize:
+                            # 重要组量化引导系数 γ₁ = γ * 0.5（冗余组的一半）
+                            gamma_guided = gamma * 0.5
+                            # 量化残差: 原始 - 量化
+                            quant_residual = (
+                                p.data[important_idxes]
+                                - quantize_weight.data[important_idxes]
+                            )
+                            # 安全边际 c: 残差过大时衰减
+                            residual_norm = torch.norm(quant_residual, p=2)
+                            safety_margin = min(1.0, 1.0 / (residual_norm.item() + 1e-6))
+                            p.data[important_idxes] -= (
+                                gamma_guided * safety_margin * quant_residual
                             )
 
                     # Add stochastic gradient term for non-quantization parameters

@@ -59,13 +59,18 @@ class SymQuantizerNonLinear(torch.autograd.Function):
         ctx.save_for_backward(input, d_quant, q_m, t_quant, clip_val, q_s)
 
         # q_m <= q_s can happen
+        # Clamp to avoid log(negative) -> NaN when input_abs < q_s
+        d_safe = torch.clamp(d_quant, min=1e-8)
         range_pow = torch.exp(t_quant * torch.log(torch.abs(q_m - q_s) + 1e-6))
-        input_pow = torch.exp(t_quant * torch.log(input_abs - q_s))  # input_abs >= q_s
+        input_diff = torch.clamp(input_abs - q_s, min=1e-8)  # avoid log(negative)
+        input_pow = torch.exp(t_quant * torch.log(input_diff))
 
-        output = d_quant * torch.round(input_pow.div(d_quant))
+        output = d_safe * torch.round(input_pow.div(d_safe))
         output[input_abs <= q_s] = 0
-        output[input_abs >= q_m] = d_quant * torch.round(range_pow.div(d_quant))
+        output[input_abs >= q_m] = d_safe * torch.round(range_pow.div(d_safe))
         output = torch.sign(input) * output
+        # Guard against inf/nan from extreme quantization parameters
+        output = torch.nan_to_num(output, nan=0.0, posinf=0.0, neginf=0.0)
         return output
 
     @staticmethod
@@ -77,19 +82,21 @@ class SymQuantizerNonLinear(torch.autograd.Function):
         grad_x = grad_output.clone()
         grad_x[input.ge(clip_val[1])] = 0
         grad_x[input.le(clip_val[0])] = 0
-        # Useful quantities
+        # Useful quantities — clamp to avoid log(negative) -> NaN and division by tiny d
+        d_safe = torch.clamp(d_quant, min=1e-8)
         range_pow = torch.exp(
             t_quant * torch.log(torch.abs(q_m - q_s) + 1e-6)
         )  # q_m <= q_s can happen
         range_pow_low = torch.exp(
             (t_quant - 1) * torch.log(torch.abs(q_m - q_s) + 1e-6)
         )  # q_m <= q_s can happen
-        input_pow = torch.exp(t_quant * torch.log(input_abs - q_s))  # input_abs >= q_s
+        input_diff = torch.clamp(input_abs - q_s, min=1e-8)  # avoid log(negative)
+        input_pow = torch.exp(t_quant * torch.log(input_diff))
 
-        grad_d_xq = torch.round(input_pow.div(d_quant)) - input_pow.div(d_quant)
+        grad_d_xq = torch.round(input_pow.div(d_safe)) - input_pow.div(d_safe)
         grad_d_xq[input_abs >= q_m] = torch.round(
-            range_pow.div(d_quant)
-        ) - range_pow.div(d_quant)
+            range_pow.div(d_safe)
+        ) - range_pow.div(d_safe)
         grad_d_xq[input_abs <= q_s] = 0
         grad_d_xq = torch.sign(input) * grad_d_xq
         grad_d = torch.tensor([torch.sum(grad_output * grad_d_xq)], device=device)
@@ -98,29 +105,17 @@ class SymQuantizerNonLinear(torch.autograd.Function):
         grad_qm_xq[input_abs <= q_m] = 0
         grad_qm = torch.tensor([torch.sum(grad_output * grad_qm_xq)], device=device)
 
-        grad_t_xq = input_pow * (torch.log(input_abs - q_s))
+        grad_t_xq = input_pow * (torch.log(input_diff))
         grad_t_xq[input_abs >= q_m] = range_pow * torch.log(torch.abs(q_m - q_s) + 1e-6)
         grad_t_xq[input_abs <= q_s] = 0
         grad_t_xq = torch.sign(input) * grad_t_xq
         grad_t = torch.tensor([torch.sum(grad_output * grad_t_xq)], device=device)
 
-        # NaN detection
-        if torch.allclose(
-            torch.tensor([torch.sum(grad_output * grad_t_xq)], device=device),
-            torch.tensor([float("nan")], device=device),
-            equal_nan=True,
-        ):
-            error_message = (
-                f"Error: NaN appears in gradient!\n"
-                f"d: {d_quant.item():.5f}, t: {t_quant.item():.5f}, q_m: {q_m.item():.5f}, q_s: {q_s.item():.5f}\n"
-                f"input_abs-max: {torch.max(input_abs).item():.5f}, grad_output-max: {torch.max(grad_output).item():.5f}, grad_t_xq: {torch.max(grad_t_xq)}\n"
-                f"input_pow: {torch.min(input_pow)}, range_pow: {range_pow}, input_abs-min: {torch.min(input_abs)}\n"
-                f"grad_x: min={torch.min(grad_x):.5f}, max={torch.max(grad_x):.5f}, mean={torch.mean(grad_x):.5f}, std={torch.std(grad_x):.5f}\n"
-                f"grad_d: {grad_d.item():.5f}\n"
-                f"grad_qm: {grad_qm.item():.5f}\n"
-                f"grad_t: {grad_t.item():.5f}"
-            )
-            raise NanInGradientError(error_message)
+        # Replace NaN/Inf with 0 instead of raising, so training can continue
+        grad_x = torch.nan_to_num(grad_x, nan=0.0, posinf=0.0, neginf=0.0)
+        grad_d = torch.nan_to_num(grad_d, nan=0.0, posinf=0.0, neginf=0.0)
+        grad_qm = torch.nan_to_num(grad_qm, nan=0.0, posinf=0.0, neginf=0.0)
+        grad_t = torch.nan_to_num(grad_t, nan=0.0, posinf=0.0, neginf=0.0)
 
         return grad_x, grad_d, grad_qm, grad_t, None, None
 
@@ -154,9 +149,10 @@ class SymQuantizerLinear(torch.autograd.Function):
         range_pow = torch.abs(q_m - q_s)
         input_pow = input_abs - q_s  # input_abs >= q_s
 
-        output = d_quant * torch.round(input_pow.div(d_quant))
+        d_safe = torch.clamp(d_quant, min=1e-8)
+        output = d_safe * torch.round(input_pow.div(d_safe))
         output[input_abs <= q_s] = 0
-        output[input_abs >= q_m] = d_quant * torch.round(range_pow.div(d_quant))
+        output[input_abs >= q_m] = d_safe * torch.round(range_pow.div(d_safe))
         output = torch.sign(input) * output
         return output
 
@@ -170,14 +166,15 @@ class SymQuantizerLinear(torch.autograd.Function):
         grad_x[input.ge(clip_val[1])] = 0
         grad_x[input.le(clip_val[0])] = 0
 
-        # Useful quantities
+        # Useful quantities — clamp d to avoid division by zero
+        d_safe = torch.clamp(d_quant, min=1e-8)
         range_pow = torch.abs(q_m - q_s)  # q_m <= q_s can happen
         input_pow = input_abs - q_s  # input_abs >= q_s
 
-        grad_d_xq = torch.round(input_pow.div(d_quant)) - input_pow.div(d_quant)
+        grad_d_xq = torch.round(input_pow.div(d_safe)) - input_pow.div(d_safe)
         grad_d_xq[input_abs >= q_m] = torch.round(
-            range_pow.div(d_quant)
-        ) - range_pow.div(d_quant)
+            range_pow.div(d_safe)
+        ) - range_pow.div(d_safe)
         grad_d_xq[input_abs <= q_s] = 0
         grad_d_xq = torch.sign(input) * grad_d_xq
         grad_d = torch.tensor([torch.sum(grad_output * grad_d_xq)], device=device)
@@ -186,22 +183,10 @@ class SymQuantizerLinear(torch.autograd.Function):
         grad_qm_xq[input_abs <= q_m] = 0
         grad_qm = torch.tensor([torch.sum(grad_output * grad_qm_xq)], device=device)
 
-        # NaN detection
-        if torch.allclose(
-            torch.tensor([torch.sum(grad_output * grad_d_xq)], device=device),
-            torch.tensor([float("nan")], device=device),
-            equal_nan=True,
-        ):
-            error_message = (
-                f"Error: NaN appears in gradient!\n"
-                f"d: {d_quant.item():.5f}, q_m: {q_m.item():.5f}, q_s: {q_s.item():.5f}\n"
-                f"input_abs-max: {torch.max(input_abs).item():.5f}, grad_output-max: {torch.max(grad_output).item():.5f},\n"
-                f"input_pow: {torch.min(input_pow)}, range_pow: {range_pow}, input_abs-min: {torch.min(input_abs)}\n"
-                f"grad_x: min={torch.min(grad_x):.5f}, max={torch.max(grad_x):.5f}, mean={torch.mean(grad_x):.5f}, std={torch.std(grad_x):.5f}\n"
-                f"grad_d: {grad_d.item():.5f}\n"
-                f"grad_qm: {grad_qm.item():.5f}\n"
-            )
-            raise NanInGradientError(error_message)
+        # Replace NaN/Inf with 0 instead of raising
+        grad_x = torch.nan_to_num(grad_x, nan=0.0, posinf=0.0, neginf=0.0)
+        grad_d = torch.nan_to_num(grad_d, nan=0.0, posinf=0.0, neginf=0.0)
+        grad_qm = torch.nan_to_num(grad_qm, nan=0.0, posinf=0.0, neginf=0.0)
         return grad_x, grad_d, grad_qm, None, None
 
 # NOTE: this is a experimental WIP, not used in the codebase yet

@@ -205,6 +205,8 @@ class NodeGroup(BasicNodeGroup):
                     norm_group = torch.norm(param_transform, dim=1) ** 2
                 else:
                     norm_group += torch.norm(param_transform, dim=1) ** 2
+            # 【Bug Fix】当所有参数都是 NO_PRUNE/lora_A 时，norm_group 保持 None
+            # NodeGroupComposedOp 已有此检查，这里补充完整
             if norm_group is None:
                 self.pruning_important_idxes, self.pruning_redundant_idxes = list(), list()
                 return

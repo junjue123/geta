@@ -15,6 +15,9 @@ def importance_score_by_magnitude(param_group):
                 norm_group = torch.norm(param_transform, dim=1) ** 2
             else:
                 norm_group += torch.norm(param_transform, dim=1) ** 2
+    # Guard: all params NO_PRUNE -> norm_group stays None
+    if norm_group is None:
+        norm_group = torch.zeros(param_group['num_groups'], device=param_group['params'][0].device)
     param_group['importance_scores']['magnitude'] = torch.sqrt(norm_group)
 
 def importance_score_by_avg_magnitude(param_group):
@@ -31,6 +34,8 @@ def importance_score_by_avg_magnitude(param_group):
             else:
                 norm_group += torch.norm(param_transform, dim=1) ** 2
         group_sizes += param_transform.shape[1]
+    if norm_group is None:
+        norm_group = torch.zeros(param_group['num_groups'], device=param_group['params'][0].device)
     param_group['importance_scores']['avg_magnitude'] = torch.sqrt(norm_group) / float(group_sizes + 1e-6)
 
 def importance_score_by_magnitude_lora(param_group):

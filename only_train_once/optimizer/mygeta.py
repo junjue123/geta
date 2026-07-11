@@ -683,7 +683,12 @@ class MyGETA(BaseHybridSparseOptimizer):
                 if layer_name in p_name and "d_quant_act" in p_name:
                     d_quant_min = self._d_quant_helper(max_bit, q_m_act, t_quant_act)
                     d_quant_max = self._d_quant_helper(min_bit, q_m_act, t_quant_act)
-                    p.data = torch.clip(p.data, min=d_quant_min, max=d_quant_max)
+                    # Guard against inf/overflow in clip
+                    d_quant_min = float(d_quant_min) if not math.isinf(d_quant_min) else 1e-8
+                    d_quant_max = float(d_quant_max) if not math.isinf(d_quant_max) else 1.0
+                    if d_quant_min > d_quant_max:
+                        d_quant_min, d_quant_max = d_quant_max, d_quant_min
+                    p.data = torch.clamp(p.data, min=d_quant_min, max=d_quant_max)
 
     def partial_projected_gradient_descent_step_fix(self, param_group, bit_dict):
         for p_name, p in zip(param_group["p_names"], param_group["params"]):
@@ -764,8 +769,13 @@ class MyGETA(BaseHybridSparseOptimizer):
         q_m = max(abs(q_m), 1e-10)
 
         # Calculate d_quant using scalar math
-        # d_quant = math.exp(t_quant * math.log(q_m)) / (2 ** (bit_width - 1) - 1)
-        d_quant = math.exp(t_quant * math.log(abs(q_m))) / (2 ** (bit_width - 1) - 1)
+        # Clamp exponent to avoid math.exp overflow
+        exponent = t_quant * math.log(abs(q_m))
+        exponent = max(min(exponent, 50.0), -50.0)  # clamp to avoid overflow
+        # 防御: bit_width==1 时 (2**0 - 1)=0 会触发 ZeroDivisionError，
+        #       钳制分母使用的有效位宽下限为 2 (与 min_bit_wt 一致)。
+        eff_bw = max(bit_width, 2)
+        d_quant = math.exp(exponent) / (2 ** (eff_bw - 1) - 1)
         return d_quant
 
     @staticmethod
