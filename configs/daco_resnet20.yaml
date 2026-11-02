@@ -1,0 +1,51 @@
+# DACO CIFAR-10 训练配置 (ResNet-20 + GETA)
+# 用法: python run_daco_cifar10.py --config configs/daco_resnet20.yaml
+# 命令行参数仍可覆盖 YAML (例如 --epochs 50 --quick-test)
+# 需要 PyYAML: pip install pyyaml
+
+# ===== 模型 =====
+model: resnet20                # vgg7 | resnet20
+
+# ===== 数据集 (完全可配置) =====
+dataset:
+  name: cifar10                # cifar10 | random
+  data_dir: /root/autodl-tmp/data
+  batch_size: 128
+  num_workers: 4
+  augmentation:
+    random_crop_padding: 4
+    random_horizontal_flip: true
+  normalization:
+    mean: [0.4914, 0.4822, 0.4465]
+    std: [0.2023, 0.1994, 0.2010]
+
+# ===== 训练调度 =====
+epochs: 200
+warmup_epochs: 10
+cooldown_epochs: 20
+seed: 1
+deterministic: false
+
+# ===== 输出 =====
+out: outputs/autodl_experiments
+save_ckpt: false
+ckpt_every: 0
+
+# ===== 压缩超参 (对齐 DACO.tex L385-387) =====
+compression:
+  target_group_sparsity: 0.5
+  bit_reduction: 1
+  min_bit_wt: 4
+  max_bit_wt: 16
+  min_bit_act: 2
+  max_bit_act: 16
+  phi_b_threshold: 0.9
+  kappa: 0.5
+  W: 5
+  beta_p: 1.0
+  diffusion_noise_init: 0.0001
+  diffusion_noise_ratio: 0.5
+
+# ===== 超参扫描 (可选) =====
+# hparam: phi_b
+# hvalue: 0.5

@@ -37,6 +37,11 @@ DACO CIFAR-10 真实训练 + 超参数敏感性实验
 
   # 自定义数据路径 / 输出目录
   python run_daco_cifar10.py --data-dir /root/autodl-tmp/data --out outputs/autodl_experiments
+
+  # YAML 配置驱动 (推荐): 在 configs/daco_vgg7.yaml 配置模型/步数/调度/压缩超参
+  python run_daco_cifar10.py --config configs/daco_vgg7.yaml
+  # 命令行参数仍可覆盖 YAML (例如临时改 epochs)
+  python run_daco_cifar10.py --config configs/daco_vgg7.yaml --epochs 50 --quick-test
 """
 
 import os
@@ -89,6 +94,19 @@ PAPER_DEFAULTS = dict(
 )
 
 
+def load_yaml_config(path):
+    """加载 YAML 配置文件, 返回 dict (需要 PyYAML)"""
+    try:
+        import yaml
+    except ImportError:
+        raise ImportError(
+            "YAML 配置需要 PyYAML, 请安装: pip install pyyaml"
+        )
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    return cfg or {}
+
+
 def set_seed(seed, deterministic=False):
     """Seed Python, NumPy and PyTorch before every independent run."""
     random.seed(seed)
@@ -131,20 +149,27 @@ def build_model(model_name, device):
 # ===========================================================================
 # 2. 数据加载
 # ===========================================================================
-def get_dataloaders(data_dir, batch_size=128, num_workers=4, seed=1):
-    """CIFAR-10 数据加载器 (标准增强: 随机裁剪 + 水平翻转)"""
+def get_dataloaders(data_dir, batch_size=128, num_workers=4, seed=1,
+                    aug_cfg=None, norm_cfg=None):
+    """CIFAR-10 数据加载器 (增强/归一化可由 YAML dataset 段配置)"""
     import torchvision
     import torchvision.transforms as transforms
 
-    train_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-    ])
+    aug_cfg = aug_cfg or {}
+    norm_cfg = norm_cfg or {}
+    padding = aug_cfg.get("random_crop_padding", 4)
+    hflip = aug_cfg.get("random_horizontal_flip", True)
+    mean = tuple(norm_cfg.get("mean", (0.4914, 0.4822, 0.4465)))
+    std = tuple(norm_cfg.get("std", (0.2023, 0.1994, 0.2010)))
+
+    train_layers = [transforms.RandomCrop(32, padding=padding)]
+    if hflip:
+        train_layers.append(transforms.RandomHorizontalFlip())
+    train_layers += [transforms.ToTensor(), transforms.Normalize(mean, std)]
+    train_transform = transforms.Compose(train_layers)
     test_transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        transforms.Normalize(mean, std),
     ])
 
     trainset = torchvision.datasets.CIFAR10(
@@ -425,16 +450,19 @@ def run_experiment(args, hparam_name=None, hparam_value=None):
         print(f"  Hparam: {hparam_name} = {hparam_value}")
     print(f"{'='*70}")
 
-    # 数据
-    if getattr(args, 'random_data', False):
+    # 数据 (由 YAML dataset 段驱动)
+    dataset_name = getattr(args, 'dataset_name', 'cifar10')
+    if dataset_name == "random" or getattr(args, 'random_data', False):
         print("  [RANDOM DATA] 使用随机数据 (无需 CIFAR-10)")
         trainloader, testloader = get_random_dataloaders(
             args.batch_size, args.num_workers, seed=args.seed)
     else:
         trainloader, testloader = get_dataloaders(
-            args.data_dir, args.batch_size, args.num_workers, seed=args.seed)
+            args.data_dir, args.batch_size, args.num_workers, seed=args.seed,
+            aug_cfg=getattr(args, 'aug_cfg', None),
+            norm_cfg=getattr(args, 'norm_cfg', None))
     steps_per_epoch = len(trainloader)
-    print(f"  Train batches: {steps_per_epoch}, Test batches: {len(testloader)}")
+    print(f"  [DATA] dataset={dataset_name} Train batches: {steps_per_epoch}, Test batches: {len(testloader)}")
 
     # 模型 + 优化器
     model, dummy = build_model(args.model, device)
@@ -445,8 +473,8 @@ def run_experiment(args, hparam_name=None, hparam_value=None):
 
     # 设置剪枝/投影步数 (按实际 epoch 数对齐论文比例)
     # warmup: 10 epochs, joint: args.epochs, cooldown: 20 epochs
-    warmup_epochs = 10 if not args.quick_test else 0
-    cooldown_epochs = 20 if not args.quick_test else 0
+    warmup_epochs = args.warmup_epochs if not args.quick_test else 0
+    cooldown_epochs = args.cooldown_epochs if not args.quick_test else 0
     total_epochs = warmup_epochs + args.epochs + cooldown_epochs
 
     configure_training_schedule(opt, warmup_epochs, args.epochs, steps_per_epoch)
@@ -603,28 +631,62 @@ def save_result(result, out_dir):
 # 8. 入口
 # ===========================================================================
 def main():
-    parser = argparse.ArgumentParser(description="DACO CIFAR-10 超参数敏感性实验")
-    parser.add_argument("--model", type=str, default="vgg7",
+    # 第一次解析: 只取 --config, 以便 YAML 覆盖 argparse 默认值
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", type=str, default=None,
+                            help="YAML 配置文件路径 (覆盖默认参数, 命令行参数仍优先)")
+    pre_args, _ = pre_parser.parse_known_args()
+
+    yaml_cfg = {}
+    if pre_args.config:
+        yaml_cfg = load_yaml_config(pre_args.config)
+        print(f"[YAML] 加载配置: {pre_args.config}")
+
+    # compression 超参覆盖 PAPER_DEFAULTS
+    comp = yaml_cfg.get("compression", {})
+    if comp:
+        PAPER_DEFAULTS.update(comp)
+        print(f"[YAML] compression 超参已覆盖 PAPER_DEFAULTS:")
+        for k, v in comp.items():
+            print(f"       {k} = {v}")
+
+    # 第二次解析: 完整参数, default 从 YAML 取 (命令行显式传入仍优先)
+    parser = argparse.ArgumentParser(
+        description="DACO CIFAR-10 超参数敏感性实验 (支持 --config YAML 配置)")
+    parser.add_argument("--config", type=str, default=None,
+                        help="YAML 配置文件路径 (覆盖默认参数, 命令行参数仍优先)")
+    parser.add_argument("--model", type=str, default=yaml_cfg.get("model", "vgg7"),
                         choices=["vgg7", "resnet20"],
                         help="网络架构 (默认 vgg7)")
-    parser.add_argument("--epochs", type=int, default=200,
+    parser.add_argument("--epochs", type=int, default=yaml_cfg.get("epochs", 200),
                         help="联合剪枝-量化训练 epochs (默认 200)")
-    parser.add_argument("--hparam", type=str, default=None,
+    parser.add_argument("--warmup-epochs", type=int,
+                        default=yaml_cfg.get("warmup_epochs", 10),
+                        help="warmup epochs (默认 10)")
+    parser.add_argument("--cooldown-epochs", type=int,
+                        default=yaml_cfg.get("cooldown_epochs", 20),
+                        help="cooldown epochs (默认 20)")
+    parser.add_argument("--hparam", type=str, default=yaml_cfg.get("hparam"),
                         choices=["beta_p", "phi_b", "kappa"],
                         help="扫描哪个超参 (不指定则跑默认配置)")
-    parser.add_argument("--hvalue", type=float, default=None,
+    parser.add_argument("--hvalue", type=float, default=yaml_cfg.get("hvalue"),
                         help="单个超参取值 (不指定则扫描全部取值)")
-    parser.add_argument("--data-dir", type=str, default="/root/autodl-tmp/data",
+    parser.add_argument("--data-dir", type=str,
+                        default=yaml_cfg.get("data_dir", "/root/autodl-tmp/data"),
                         help="CIFAR-10 数据目录")
-    parser.add_argument("--out", type=str, default="outputs/autodl_experiments",
+    parser.add_argument("--out", type=str,
+                        default=yaml_cfg.get("out", "outputs/autodl_experiments"),
                         help="结果输出目录")
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--batch-size", type=int,
+                        default=yaml_cfg.get("batch_size", 128))
+    parser.add_argument("--num-workers", type=int,
+                        default=yaml_cfg.get("num_workers", 4))
     parser.add_argument("--save-ckpt", action="store_true",
                         help="保存模型 checkpoint")
-    parser.add_argument("--ckpt-every", type=int, default=0,
+    parser.add_argument("--ckpt-every", type=int,
+                        default=yaml_cfg.get("ckpt_every", 0),
                         help="每 N 个 epoch 保存训练 checkpoint，0 表示不周期保存")
-    parser.add_argument("--seed", type=int, default=1,
+    parser.add_argument("--seed", type=int, default=yaml_cfg.get("seed", 1),
                         help="随机种子")
     parser.add_argument("--deterministic", action="store_true",
                         help="启用确定性 cuDNN，用于严格策略对照")
@@ -633,6 +695,28 @@ def main():
     parser.add_argument("--random-data", action="store_true",
                         help="用随机数据代替 CIFAR-10 (验证代码链路, 不需下载数据集)")
     args = parser.parse_args()
+
+    # store_true 参数: YAML bool 与命令行 flag 取 OR
+    for flag in ("save_ckpt", "deterministic", "quick_test", "random_data"):
+        if yaml_cfg.get(flag):
+            setattr(args, flag, True)
+
+    # dataset 段合并: data_dir/batch_size/num_workers 可在 dataset 段覆盖顶层
+    ds_cfg = yaml_cfg.get("dataset", {})
+    if ds_cfg:
+        args.data_dir = ds_cfg.get("data_dir", args.data_dir)
+        args.batch_size = ds_cfg.get("batch_size", args.batch_size)
+        args.num_workers = ds_cfg.get("num_workers", args.num_workers)
+        args.dataset_name = ds_cfg.get("name", "cifar10")
+        args.aug_cfg = ds_cfg.get("augmentation", {})
+        args.norm_cfg = ds_cfg.get("normalization", {})
+    else:
+        args.dataset_name = "cifar10"
+        args.aug_cfg = {}
+        args.norm_cfg = {}
+    # dataset.name=random 等价于 random_data (向后兼容)
+    if args.dataset_name == "random":
+        args.random_data = True
 
     # 冒烟测试模式
     if args.quick_test:

@@ -1,0 +1,57 @@
+# DACO CIFAR-10 训练配置 (VGG-7 + GETA)
+# 用法: python run_daco_cifar10.py --config configs/daco_vgg7.yaml
+# 命令行参数仍可覆盖 YAML (例如 --epochs 50 --quick-test)
+# 需要 PyYAML: pip install pyyaml
+
+# ===== 模型 =====
+model: vgg7                    # vgg7 | resnet20
+
+# ===== 数据集 (完全可配置) =====
+dataset:
+  name: cifar10                # cifar10 | random (random=不依赖真实数据, 验证链路)
+  data_dir: /root/autodl-tmp/data
+  batch_size: 128
+  num_workers: 4
+  # 数据增强 (CIFAR-10 标准增强, 留空用默认)
+  augmentation:
+    random_crop_padding: 4
+    random_horizontal_flip: true
+  # 归一化 (CIFAR-10 通道均值/标准差, 留空用默认)
+  normalization:
+    mean: [0.4914, 0.4822, 0.4465]
+    std: [0.2023, 0.1994, 0.2010]
+
+# ===== 训练调度 =====
+epochs: 200                    # 联合剪枝-量化训练 epochs
+warmup_epochs: 10              # warmup (纯 SGD)
+cooldown_epochs: 20            # cooldown (固定投影)
+seed: 1
+deterministic: false           # 严格策略对照时设 true
+
+# ===== 输出 =====
+out: outputs/autodl_experiments
+save_ckpt: false
+ckpt_every: 0                  # 每 N epoch 存训练 checkpoint, 0=不周期存
+
+# ===== 压缩超参 (覆盖 PAPER_DEFAULTS, 对齐 DACO.tex L385-387) =====
+compression:
+  target_group_sparsity: 0.5   # 目标组稀疏度
+  bit_reduction: 1             # 每次位宽缩减步长
+  min_bit_wt: 4                # b_ε = 4 (权重最低位宽)
+  max_bit_wt: 16               # 权重最高位宽
+  min_bit_act: 2               # 激活最低位宽
+  max_bit_act: 16              # 激活最高位宽
+  phi_b_threshold: 0.9         # φ_b 位宽自适应触发阈值
+  kappa: 0.5                   # κ MCSS 平衡系数
+  W: 5                         # MCSS 滑动窗口
+  beta_p: 1.0                  # β_p RCAJS 阻尼系数
+  diffusion_noise_init: 0.0001 # DGD 初始噪声
+  diffusion_noise_ratio: 0.5   # DGD 噪声比例
+
+# ===== 超参扫描 (可选, 留空则跑默认配置) =====
+# hparam: beta_p               # beta_p | phi_b | kappa
+# hvalue: 0.1                  # 单个值; 留空则扫描全部取值 (见 HPARAM_SWEEP)
+
+# ===== 冒烟测试 (可选) =====
+# quick_test: true             # 1 epoch, 无 warmup/cooldown
+# random_data: true            # 等价于 dataset.name: random
