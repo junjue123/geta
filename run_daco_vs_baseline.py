@@ -526,6 +526,32 @@ def extract_class_prototypes(model, loader, device, feat_hook_target="avg_pool",
 # ===========================================================================
 # 单次实验
 # ===========================================================================
+def _flush_epoch_artifacts(args, mode, history, prototypes_seq):
+    """每个 epoch 结束时增量落盘, 保证训练中断也能保留已产出的数据。
+
+    产物:
+      prototypes/{model}_{mode}_protos.npy  (T_sofar, 10, D) 类别原型序列
+      {mode}_history.jsonl                  每行一个 epoch 的全部指标
+
+    用覆盖写而非追加: 与内存中的 history 完全同步(幂等), 且文件很小
+    (100 epoch 的 npy 约 256 KB, jsonl 约 20 KB), 写盘开销可忽略。
+    """
+    try:
+        proto_dir = os.path.join(args.out, "prototypes")
+        os.makedirs(proto_dir, exist_ok=True)
+        arr = np.stack(prototypes_seq, axis=0).astype(np.float32)
+        np.save(os.path.join(proto_dir, f"{args.model}_{mode}_protos.npy"), arr)
+
+        keys = list(history.keys())
+        hp = os.path.join(args.out, f"{mode}_history.jsonl")
+        with open(hp, "w", encoding="utf-8") as f:
+            for i in range(len(history["epoch"])):
+                f.write(json.dumps({k: history[k][i] for k in keys},
+                                   ensure_ascii=False) + "\n")
+    except Exception as e:  # 落盘失败不应打断训练
+        print(f"  [WARN] 增量落盘失败: {e}", flush=True)
+
+
 def run_experiment(args, mode):
     set_seed(args.seed, args.deterministic)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -598,6 +624,12 @@ def run_experiment(args, mode):
         history["bit_compress"].append(round(m["bit_compress"], 2))
         history["overall_compress"].append(round(m["overall_compress"], 2))
         history["lr"].append(round(opt.param_groups[0]["lr"], 6))
+
+        # 增量落盘: 每个 epoch 结束立即写盘。
+        # 原先只在训练全部结束后才 np.save, 一旦中途中断(崩溃/手动停止)则
+        # 几小时的原型数据全部丢失, 改图只能重跑。改为逐 epoch 覆盖写后,
+        # 任何时刻磁盘上都有"到目前为止"的完整可画图数据。
+        _flush_epoch_artifacts(args, mode, history, prototypes_seq)
 
     elapsed = time.time() - t0
     m_final = collect_metrics(opt)
