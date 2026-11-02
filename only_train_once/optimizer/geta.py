@@ -13,10 +13,11 @@ from only_train_once.transform import (
 )
 
 from .base_hybrid_sparse_optimizer import BaseHybridSparseOptimizer
+from .importance_score import set_log_dir as _set_score_log_dir
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+) if not logging.getLogger().handlers else None
 
 
 class RCAJSController:
@@ -315,6 +316,8 @@ class GETA(BaseHybridSparseOptimizer):
     ):
         self.log_dir = log_dir
         os.makedirs(self.log_dir, exist_ok=True)
+        # 分数记录目录跟随 log_dir (避免多实验写同一 temp/ 冲突)
+        _set_score_log_dir(os.path.join(self.log_dir, "scores"))
         self.logger = logging.getLogger(self.__class__.__name__)
         self.start_projection_step = start_projection_step
         self.projection_steps = projection_steps
@@ -518,6 +521,12 @@ class GETA(BaseHybridSparseOptimizer):
             :curr_active_num_adaptive
         ].tolist()
         self.pruned_group_idxes.extend(top_indices)
+        self.logger.info(
+            f"[DACO][PRUNE] period={self.curr_pruning_period} "
+            f"requested={curr_active_num_adaptive} actual_pruned={len(top_indices)} "
+            f"cumulative_pruned={len(self.pruned_group_idxes)} "
+            f"actual_K={actual_K} global_scores={len(global_scores)}"
+        )
 
         for group in self.param_groups:
             if group["is_prunable"] and not group["is_auxiliary"]:
@@ -1129,25 +1138,32 @@ class GETA(BaseHybridSparseOptimizer):
         return output
 
     def log_qm_projection(self):
-        """Log q_m during projection"""
-        if (self.num_steps >= self.start_projection_step and 
-            self.num_steps <= self.start_projection_step + self.projection_steps and
-            self.num_steps % 1000 == 0):
-            
-            log_file = os.path.join(self.log_dir, f"projection_qm_{self.num_steps}.txt")
-            with self.safe_open_file(log_file, "w") as f:
-                curr_period = (self.num_steps - self.start_projection_step) // self.projection_period_duration
-                f.write(f"Step: {self.num_steps}, Projection Period: {curr_period}\n")
-                f.write(f"Current max_bit_wt: {self.max_bit_wt}\n\n")
-                
-                for group in self.param_groups:
-                    for p_name, p in zip(group["p_names"], group["params"]):
-                        if "q_m_wt" in p_name:
-                            layer_name = ".".join(p_name.split(".")[:-1])
-                            f.write(f"Layer: {layer_name}\n")
-                            f.write(f"q_m stats: min={p.data.min().item():.6f}, ")
-                            f.write(f"max={p.data.max().item():.6f}, ")
-                            f.write(f"mean={p.data.mean().item():.6f}\n\n")
+        """Log q_m during projection (每个 projection period 记一次)"""
+        if not (self.num_steps >= self.start_projection_step and
+                self.num_steps <= self.start_projection_step + self.projection_steps):
+            return
+        # 修复: 原 % 1000 在投影阶段(通常仅几步)永不触发, 改为按 period_duration 记录
+        period_dur = max(self.projection_period_duration, 1)
+        if (self.num_steps - self.start_projection_step) % period_dur != 0:
+            return
+
+        log_file = os.path.join(self.log_dir, f"projection_qm_{self.num_steps}.txt")
+        with self.safe_open_file(log_file, "w") as f:
+            curr_period = (self.num_steps - self.start_projection_step) // period_dur
+            f.write(f"Step: {self.num_steps}, Projection Period: {curr_period}\n")
+            f.write(f"Current max_bit_wt: {self.max_bit_wt}\n\n")
+            for group in self.param_groups:
+                for p_name, p in zip(group["p_names"], group["params"]):
+                    if "q_m_wt" in p_name:
+                        layer_name = ".".join(p_name.split(".")[:-1])
+                        f.write(f"Layer: {layer_name}\n")
+                        f.write(f"q_m stats: min={p.data.min().item():.6f}, ")
+                        f.write(f"max={p.data.max().item():.6f}, ")
+                        f.write(f"mean={p.data.mean().item():.6f}\n\n")
+        self.logger.info(
+            f"[DACO][PROJ] step={self.num_steps} period={curr_period} "
+            f"max_bit_wt={self.max_bit_wt} log={log_file}"
+        )
 
     def step(self, loss=None, closure=None):
         """
@@ -1188,7 +1204,7 @@ class GETA(BaseHybridSparseOptimizer):
                 if bit_adaptive_triggered:
                     self.max_bit_wt = max(self.max_bit_wt - self.bit_reduction, self.min_bit_wt)
                     self.logger.info(
-                        f"[RCAJS] 位宽自适应触发: max_bit_wt -> {self.max_bit_wt}"
+                        f"[DACO][RCAJS] projection bit_adaptive triggered: max_bit_wt={self.max_bit_wt}"
                     )
                 else:
                     self.max_bit_wt = self.max_bit_wt - self.bit_reduction
@@ -1204,7 +1220,7 @@ class GETA(BaseHybridSparseOptimizer):
                 self.num_steps - self.start_pruning_step - 1
             ) % self.pruning_period_duration == 0:
                 self.logger.info(
-                    f"Determining important and redundant groups using saliency scores. Step={self.num_steps}"
+                    f"[DACO][PRUNE] step={self.num_steps} period={self.curr_pruning_period} begin identify_redundant"
                 )
                 self.commit_redundant_idxes()
                 self.compute_importance_scores()

@@ -11,6 +11,16 @@ import math
 # 结构化日志: [DACO][MCSS] layer=... crit=... cv_factor=... bit_factor=... adjusted_mean=...
 _logger = logging.getLogger("DACO.importance_score")
 
+# 分数记录目录 (由优化器 set_log_dir 覆盖, 默认 temp)
+_LOG_DIR = os.path.join("temp")
+
+
+def set_log_dir(path):
+    """设置分数记录/绘图目录 (跟随优化器 log_dir, 避免多实验写同一 temp/ 冲突)"""
+    global _LOG_DIR
+    _LOG_DIR = path
+    os.makedirs(_LOG_DIR, exist_ok=True)
+
 # --- 全局变量用于存储绘图历史 ---
 # 结构: {'layer_name': {'magnitude': [v1, v2...], 'steps': [1, 2...]}}
 _SCORE_HISTORY = {}
@@ -35,8 +45,8 @@ def _record_and_plot(param_group, step=None):
     辅助函数：记录分数到 log 并绘图到 temp 文件夹
     注意：此函数记录的是【原始/Raw】分数，用于后续计算方差。
     """
-    # 1. 准备目录
-    save_dir = "temp"
+    # 1. 准备目录 (跟随优化器 log_dir, 由 set_log_dir 设置, 默认 temp)
+    save_dir = _LOG_DIR
     os.makedirs(save_dir, exist_ok=True)
     log_file = os.path.join(save_dir, "scores_log_raw.txt")
 

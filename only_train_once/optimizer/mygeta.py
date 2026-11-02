@@ -16,7 +16,7 @@ from .base_hybrid_sparse_optimizer import BaseHybridSparseOptimizer
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+) if not logging.getLogger().handlers else None
 
 
 class MyGETA(BaseHybridSparseOptimizer):
