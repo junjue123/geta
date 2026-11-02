@@ -49,6 +49,7 @@ class RCAJSController:
         self.phi_b_threshold = phi_b_threshold  # 位宽自适应触发阈值
         self.verbose = verbose
         self.device = device
+        self.logger = logging.getLogger("DACO.rcajs")
 
         # 状态追踪
         self.history_sparsity = []  # 历史稀疏度记录
@@ -126,8 +127,11 @@ class RCAJSController:
             self.early_stopped = True
             if self.verbose:
                 target_redundant = self.total_groups - self.target_num_groups
-                print(f"  [RCAJS] 提前停止触发: 剩余待剪冗余={num_active_redundant} <= 0, "
-                      f"已剪={self.total_groups - num_active_redundant}, 目标保留={self.target_num_groups}")
+                self.logger.info(
+                    f"[DACO][RCAJS] early_stop triggered: active_redundant={num_active_redundant}<=0 "
+                    f"pruned={self.total_groups - num_active_redundant} "
+                    f"target_keep={self.target_num_groups} target_redundant={target_redundant}"
+                )
             return True
         return False
 
@@ -189,11 +193,13 @@ class RCAJSController:
         self.bit_layers_total_count = total_count
 
         should_trigger = (phi_b > self.phi_b_threshold) and not self.bit_reduction_triggered
+        # 结构化日志: 记录 φ_b 实测值 (无论是否触发), 便于敏感性分析
+        self.logger.info(
+            f"[DACO][RCAJS] bit_adaptive check: phi_b={phi_b:.4f} threshold={self.phi_b_threshold} "
+            f"below_max={below_max_count}/{total_count} max_bit={max_bit} trigger={should_trigger}"
+        )
         if should_trigger:
             self.bit_reduction_triggered = True
-            if self.verbose:
-                print(f"  [RCAJS] 位宽自适应触发: φ_b={phi_b:.2%} > {self.phi_b_threshold} | "
-                      f"{below_max_count}/{total_count} 层低于 max_bit={max_bit}")
 
         return should_trigger
 
@@ -480,15 +486,26 @@ class GETA(BaseHybridSparseOptimizer):
                 f"KL={rcajs_state['kl_div']:.4f}"
             )
 
-        # --- 日志输出 RCAJS 状态（每 5 个 period 或 verbose 模式） ---
-        if (self.verbose == "True" or self.curr_pruning_period % 5 == 0):
+        # 结构化日志: 每个 period 都记录 RCAJS 全状态 (供敏感性分析)
+        self.logger.info(
+            f"[DACO][RCAJS] period={self.curr_pruning_period} "
+            f"rate={rcajs_state['prune_rate']:.4f} "
+            f"fixed={curr_active_num_redundant_groups} adaptive={curr_active_num_adaptive} "
+            f"sparsity={rcajs_state['current_sparsity']:.4f} target={self.rcajs.target_sparsity:.4f} "
+            f"delta_p={rcajs_state['delta_p']:+.4f} "
+            f"psi={rcajs_state['stability_term']:.4f} "
+            f"kl={rcajs_state['kl_div']:.4f} "
+            f"pruned_total={len(self.pruned_group_idxes)}"
+        )
+
+        # 位宽分布摘要
+        _wbits = [v.get("weight") for v in self.bit_layers.values()
+                  if isinstance(v, dict) and v.get("weight") is not None]
+        if _wbits:
             self.logger.info(
-                f"[RCAJS] Period {self.curr_pruning_period}: "
-                f"rate={rcajs_state['prune_rate']:.4f} "
-                f"(fixed={curr_active_num_redundant_groups}, adaptive={curr_active_num_adaptive}), "
-                f"sparsity={rcajs_state['current_sparsity']:.3f}/target={self.rcajs.target_sparsity:.3f}, "
-                f"Δ_p={rcajs_state['delta_p']:+.4f}, "
-                f"Ψ={rcajs_state['stability_term']:.3f}"
+                f"[DACO][BITDIST] period={self.curr_pruning_period} "
+                f"avg={sum(_wbits)/len(_wbits):.2f} min={min(_wbits)} max={max(_wbits)} "
+                f"max_bit_wt={self.max_bit_wt} n_layers={len(_wbits)}"
             )
 
         # --- 确定 top-K 冗余组 ---
@@ -735,43 +752,14 @@ class GETA(BaseHybridSparseOptimizer):
                     / (cosine_similarity_clip * flatten_clip_norm)
                 )
             else:
-                # TODO: @xiaoyi, refactor
-                if self.verbose == "True":
-                    self.logger.warning(
-                        f"Unexpected cosine_similarity_clip value: {cosine_similarity_clip}"
-                    )
-                    outID = "log_info_" + str(self.start_pruning_step)
-                    filename = os.path.join("outputs",f"sparsity_{self.target_group_sparsity*100}", f"{outID}.txt")
-                    with self.safe_open_file(filename) as logfile:
-                        logfile.write("Throw an error: cosine_similarity_clip error\n")
-                        logfile.write(
-                            "similarity_value: {cos_similar:^8.9e}\n".format(
-                                cos_similar=cosine_similarity_clip.item()
-                            )
-                        )
-                        logfile.write(
-                            "flatten_grad_max: {flatten_grad:^8.9e}\n".format(
-                                flatten_grad=torch.max(flatten_grad).item()
-                            )
-                        )
-                        logfile.write(
-                            "flatten_clip_max: {flatten_clip:^8.9e}\n".format(
-                                flatten_clip=torch.max(flatten_clip).item()
-                            )
-                        )
-                        logfile.write(
-                            "flatten_grad_mean: {flatten_grad:^8.9e}\n".format(
-                                flatten_grad=torch.mean(flatten_grad).item()
-                            )
-                        )
-                        logfile.write(
-                            "flatten_clip_mean: {flatten_clip:^8.9e}\n".format(
-                                flatten_clip=torch.mean(flatten_clip).item()
-                            )
-                        )
-                        # logfile.write("all_grad_max: {flatten_grad:^8.9e}\n".format(flatten_grad=torch.max(torch.Tensor(prune_param_grad_list))) )
-                    self.logger.error("Error with computing cosine_similarity_clip!")
-                    assert 1 == 2
+                # 修复: 原 assert 1==2 会中断 200 epoch 训练, 改为跳过该步 forget_rate=0
+                cos_val = cosine_similarity_clip.item() if hasattr(cosine_similarity_clip, 'item') else float(cosine_similarity_clip)
+                self.logger.warning(
+                    f"[DACO][GAMMA] step={self.num_steps} unexpected_cos_sim={cos_val:.4e} "
+                    f"grad_norm={flatten_grad_norm.item():.4e} clip_norm={flatten_clip_norm.item():.4e} "
+                    f"-> forget_rate=0.0 (skip, no crash)"
+                )
+                forget_rate = 0.0
 
         # Determine d_quant range
         bit_width_lower = bit_range[0]
@@ -1172,6 +1160,15 @@ class GETA(BaseHybridSparseOptimizer):
         self.num_steps += 1
         self.compute_grad_variant()
 
+        # 阶段切换日志: warmup/projection/joint/cooldown
+        _phase = ("warmup" if self.num_steps <= self.start_projection_step
+                  else "projection" if self.num_steps <= self.start_pruning_step
+                  else "joint" if self.num_steps <= self.start_pruning_step + self.pruning_steps
+                  else "cooldown")
+        if getattr(self, "_last_phase", None) != _phase:
+            self.logger.info(f"[DACO][PHASE] step={self.num_steps} phase={_phase} begin")
+            self._last_phase = _phase
+
         # Determine the bit range projection for weights
         if (
             self.num_steps >= self.start_projection_step
@@ -1245,6 +1242,12 @@ class GETA(BaseHybridSparseOptimizer):
                 #     f"Joint pruning and quantization stage. Step={self.num_steps}"
                 # )
                 decay_factor = self._get_diffusion_decay_factor()
+                if self.pruning_period_duration != 0 and t == 0:
+                    self.logger.info(
+                        f"[DACO][DIFFUSION] step={self.num_steps} decay={decay_factor:.4e} "
+                        f"noise_init={self.diffusion_noise_init} noise_ratio={self.diffusion_noise_ratio} "
+                        f"diffusion_steps={self.diffusion_steps}"
+                    )
                 if decay_factor > 1e-6:
                     for p_name, p in zip(group["p_names"], group["params"]):
                         if p.grad is None: continue
@@ -1285,10 +1288,12 @@ class GETA(BaseHybridSparseOptimizer):
                 gamma, d_quant = self.compute_gamma_d(
                     group, active_redundant_idxes, [self.min_bit_wt, self.max_bit_wt]
                 )
-                # self.logger.info(
-                #     f"Forget rate (gamma): {gamma}, Quant step size (d): {d_quant}"
-                # )
                 self.gamma, self.d_quant = gamma, d_quant
+                if self.pruning_period_duration != 0 and t == 0:
+                    self.logger.info(
+                        f"[DACO][GAMMA] step={self.num_steps} gamma={gamma:.4e} d_quant={d_quant:.4e} "
+                        f"max_bit_wt={self.max_bit_wt} min_bit_wt={self.min_bit_wt}"
+                    )
 
                 # Update quant step size d
                 for i, (p_name, p_transform) in enumerate(

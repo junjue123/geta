@@ -3,9 +3,13 @@ from .cosine_similarity import *
 from .taylor import *
 import torch
 import os
+import logging
 import matplotlib.pyplot as plt
 import numpy as np
 import math
+
+# 结构化日志: [DACO][MCSS] layer=... crit=... cv_factor=... bit_factor=... adjusted_mean=...
+_logger = logging.getLogger("DACO.importance_score")
 
 # --- 全局变量用于存储绘图历史 ---
 # 结构: {'layer_name': {'magnitude': [v1, v2...], 'steps': [1, 2...]}}
@@ -186,6 +190,7 @@ def adjust_importance_criteria(param_group, bit_layers, full_precision=32, histo
 
     # --- 2. 遍历所有评分标准进行调整 ---
     for cri_name in param_group['importance_scores']:
+        # 注: 此时分数已被 _apply_online_normalization 归一化, 变量名保留 raw_score 仅为历史兼容
         raw_score = param_group['importance_scores'][cri_name]
 
         # --- 计算方差因子 (Variance/Stability Factor) ---
@@ -220,10 +225,14 @@ def adjust_importance_criteria(param_group, bit_layers, full_precision=32, histo
         # 更新回 param_group
         param_group['importance_scores'][cri_name] = adjusted_score
 
-        # (可选) 打印调试信息，仅在 verbose 时开启
-        # if stability_factor < 0.8 or bit_factor > 2.0:
-        #     print(f"[{layer_name}][{cri_name}] Raw: {raw_score.mean():.2e} | "
-        #           f"CV_Factor: {stability_factor:.2f} | Bit_Factor: {bit_factor:.1f} -> Adj: {adjusted_score.mean():.2e}")
+        # 结构化日志: 每 period 一次, 频率可控
+        raw_mean = float(raw_score.float().mean().item()) if isinstance(raw_score, torch.Tensor) else float(raw_score)
+        adj_mean = float(adjusted_score.float().mean().item()) if isinstance(adjusted_score, torch.Tensor) else float(adjusted_score)
+        _logger.info(
+            f"[DACO][MCSS] layer={layer_name} crit={cri_name} "
+            f"smooth={smooth_factor:.3f} cv_factor={stability_factor:.3f} "
+            f"bit_factor={bit_factor:.2f} raw_mean={raw_mean:.4e} adj_mean={adj_mean:.4e}"
+        )
 
 
 def calculate_importance_score(criteria, param_group, bit_layers=None, step=None, smooth_factor=0.8):
@@ -262,9 +271,8 @@ def calculate_importance_score(criteria, param_group, bit_layers=None, step=None
     # 归一化
     _apply_online_normalization(param_group)
 
-    # 3. [新增] 根据方差和位宽调整分数
-    # 这一步会修改 param_group['importance_scores'] 的值供优化器使用
-    adjust_importance_criteria(param_group, bit_layers, smooth_factor=smooth_factor)
+    # 3. MCSS 调整由调用方(优化器)显式触发, 避免与 _apply_kappa_wiring 重复调用
+    #    导致 smooth_factor 叠加失真。见 base_hybrid_sparse_optimizer.compute_importance_scores
 
 
 def calculate_importance_score_lora(criteria, param_group, global_params, bit_layers=None, step=None, smooth_factor=0.8):
@@ -292,5 +300,4 @@ def calculate_importance_score_lora(criteria, param_group, global_params, bit_la
     # 2. 记录原始分数到历史并绘图
     _record_and_plot(param_group, step=step)
 
-    # 3. [新增] 根据方差和位宽调整分数
-    adjust_importance_criteria(param_group, bit_layers, smooth_factor=smooth_factor)
+    # 3. MCSS 调整由调用方(优化器)显式触发, 避免重复调用失真 (见 calculate_importance_score 注释)

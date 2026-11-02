@@ -14,7 +14,7 @@ from only_train_once.transform import (
 
 from .base_optimizer import BaseOptimizer
 from .hyperparameter import DEFAULT_OPT_PARAMS, SUPPORT_GRADIENT_ESTIMATES
-from .importance_score import calculate_importance_score
+from .importance_score import calculate_importance_score, adjust_importance_criteria
 
 
 class SparseOptimizerMetrics:
@@ -182,7 +182,22 @@ class BaseHybridSparseOptimizer(BaseOptimizer):
             if group["is_prunable"] and not group["is_auxiliary"]:
                 bit_layer = self.get_bitwidth_dict(group)
                 self.bit_layers.update(bit_layer)
-                calculate_importance_score(self.importance_score_criteria, group, self.bit_layers)
+                # 修复: 传入 step 以激活 _record_and_plot 的跨实验清理逻辑,
+                # 避免 CV 跨实验累积导致 stability_factor 错乱
+                calculate_importance_score(
+                    self.importance_score_criteria, group, self.bit_layers,
+                    step=self.num_steps,
+                )
+                # [DACO-MCSS] 统一入口: 若优化器设置了 _mcss_smooth_factor 则调整分数
+                # (由 run_daco_cifar10._apply_kappa_wiring 注入 kappa), 避免与 calculate_importance_score
+                # 内部重复调用导致 smooth_factor 叠加失真。adjust 在 overall 聚合前执行。
+                smooth = getattr(self, "_mcss_smooth_factor", None)
+                if smooth is not None:
+                    adjust_importance_criteria(
+                        group, self.bit_layers,
+                        history_window=getattr(self, "_mcss_history_window", 5),
+                        smooth_factor=smooth,
+                    )
 
         # Normalize importance_score
         # Calculate normalization_denoms
