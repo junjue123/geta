@@ -162,38 +162,54 @@ class SymQuantizerNonLinear(torch.autograd.Function):
         input, d_quant, q_m, t_quant, clip_val, q_s = ctx.saved_tensors
         device = input.device
         input_abs = torch.abs(input)
+        sign_in = torch.sign(input)
+        zero = torch.zeros_like(input_abs)
 
-        grad_x = grad_output.clone()
-        grad_x[input.ge(clip_val[1])] = 0
-        grad_x[input.le(clip_val[0])] = 0
+        # 直通估计: 裁剪区间外的梯度置零。
+        # masked_fill 比 clone + 两次布尔索引赋值少 2 个 kernel。
+        in_range = (input < clip_val[1]) & (input > clip_val[0])
+        grad_x = grad_output.masked_fill(~in_range, 0.0)
+
         # Useful quantities — clamp to avoid log(negative) -> NaN and division by tiny d
         d_safe = torch.clamp(d_quant, min=1e-8)
-        range_pow = torch.exp(
-            t_quant * torch.log(torch.abs(q_m - q_s) + 1e-6)
-        )  # q_m <= q_s can happen
-        range_pow_low = torch.exp(
-            (t_quant - 1) * torch.log(torch.abs(q_m - q_s) + 1e-6)
-        )  # q_m <= q_s can happen
+        rng = torch.abs(q_m - q_s) + 1e-6  # q_m <= q_s can happen
+        range_pow = torch.exp(t_quant * torch.log(rng))
+        range_pow_low = torch.exp((t_quant - 1) * torch.log(rng))
         input_diff = torch.clamp(input_abs - q_s, min=1e-8)  # avoid log(negative)
-        input_pow = torch.exp(t_quant * torch.log(input_diff))
+        # 性能: pow 比 exp(t*log(x)) 少一个全张量 kernel, 数值等价 (x > 0)
+        input_pow = torch.pow(input_diff, t_quant)
 
-        grad_d_xq = torch.round(input_pow.div(d_safe)) - input_pow.div(d_safe)
-        grad_d_xq[input_abs >= q_m] = torch.round(
-            range_pow.div(d_safe)
-        ) - range_pow.div(d_safe)
-        grad_d_xq[input_abs <= q_s] = 0
-        grad_d_xq = torch.sign(input) * grad_d_xq
-        grad_d = torch.tensor([torch.sum(grad_output * grad_d_xq)], device=device)
+        # ---- 公共量提取: mask 与 grad_output*sign(input) 在三个梯度里复用 ----
+        # 原写法每个梯度各算一次 mask / sign 乘法, 提取后每层少 4 个全张量 kernel
+        mask_ge_qm = input_abs >= q_m
+        mask_le_qs = input_abs <= q_s
+        gs = grad_output * sign_in
 
-        grad_qm_xq = torch.sign(input) * ((t_quant * range_pow_low).expand_as(input))
-        grad_qm_xq[input_abs <= q_m] = 0
-        grad_qm = torch.tensor([torch.sum(grad_output * grad_qm_xq)], device=device)
+        # ---- d_quant 梯度: round(x/d) - x/d ----
+        q = input_pow / d_safe
+        rq = range_pow / d_safe
+        grad_d_xq = torch.round(q) - q
+        grad_d_xq = torch.where(
+            mask_ge_qm,
+            (torch.round(rq) - rq).expand_as(grad_d_xq),
+            grad_d_xq,
+        )
+        grad_d_xq = torch.where(mask_le_qs, zero, grad_d_xq)
+        grad_d = (gs * grad_d_xq).sum().reshape(1)
 
-        grad_t_xq = input_pow * (torch.log(input_diff))
-        grad_t_xq[input_abs >= q_m] = range_pow * torch.log(torch.abs(q_m - q_s) + 1e-6)
-        grad_t_xq[input_abs <= q_s] = 0
-        grad_t_xq = torch.sign(input) * grad_t_xq
-        grad_t = torch.tensor([torch.sum(grad_output * grad_t_xq)], device=device)
+        # ---- q_m 梯度: 仅 input_abs > q_m 非零, 系数为标量 -> 先归约再乘常数 ----
+        g_qm = torch.where(input_abs <= q_m, zero, gs)
+        grad_qm = (g_qm.sum() * (t_quant * range_pow_low)).reshape(1)
+
+        # ---- t_quant 梯度: input_pow * log(input_diff) ----
+        grad_t_xq = input_pow * torch.log(input_diff)
+        grad_t_xq = torch.where(
+            mask_ge_qm,
+            (range_pow * torch.log(rng)).expand_as(grad_t_xq),
+            grad_t_xq,
+        )
+        grad_t_xq = torch.where(mask_le_qs, zero, grad_t_xq)
+        grad_t = (gs * grad_t_xq).sum().reshape(1)
 
         # NaN/Inf 处理: warn 策略下告警并清零, strict 策略下直接抛错 (原版行为)
         detail = (

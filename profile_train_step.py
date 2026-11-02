@@ -24,6 +24,7 @@ from sanity_check.backends.resnet20_cifar10 import resnet20_cifar10
 
 torch.manual_seed(0)
 DEV = "cuda"
+torch.backends.cudnn.benchmark = True
 
 # ---- 数据 (与 run_daco_vs_baseline 的 fast 管道一致) ----
 sys.path.insert(0, SCRIPT)

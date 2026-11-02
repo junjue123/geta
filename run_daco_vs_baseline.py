@@ -104,6 +104,10 @@ def set_seed(seed, deterministic=False):
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+    else:
+        # 输入尺寸固定(32x32), benchmark 会自动挑选最快的 conv 算法。
+        # 只影响 kernel 选择, 不改变数值结果。
+        torch.backends.cudnn.benchmark = True
 
 
 def _seed_worker(worker_id):
