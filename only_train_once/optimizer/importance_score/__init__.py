@@ -30,6 +30,35 @@ _SCORE_HISTORY = {}
 # 用于 _apply_online_normalization() 的滑动最值归一化
 _GLOBAL_SCORE_BOUNDS = {}
 
+# 记录已经在哪些 step 做过"跨实验清理", 避免同一 step 内被多个 param_group 重复清空
+_CLEARED_STEPS = set()
+
+# ---------------------------------------------------------------------------
+# 【修复】在线 min-max 归一化开关
+# ---------------------------------------------------------------------------
+# 原版 GETA 只在 BaseHybridSparseOptimizer.compute_importance_scores() 里做一次
+# Frobenius 范数归一化 (sqrt(sum(score^2)), 跨层全局)。
+#
+# 本分支曾在 calculate_importance_score() 内部额外加了一遍
+# _apply_online_normalization(): 用按 criterion 名索引的**全局** min/max 做归一化。
+# 因为 bounds 的 key 是 criterion 名而不是层名, 所有层共用同一组极值,
+# 幅值小的层会被压到 ~0, 在剪枝时被整层剪空, 直接导致模型退化。
+# 这是"量化层失效"之外的第二处会破坏训练的改动, 默认关闭以对齐原版数值行为。
+ONLINE_NORMALIZE_DEFAULT = os.environ.get("OTO_ONLINE_NORM", "0") == "1"
+
+
+def set_online_normalize(enabled: bool):
+    """显式开关在线 min-max 归一化 (默认关闭, 对齐原版单次 Frobenius 归一化)"""
+    global ONLINE_NORMALIZE_DEFAULT
+    ONLINE_NORMALIZE_DEFAULT = bool(enabled)
+
+
+def reset_score_state():
+    """清空跨实验累积的全局状态。每个新实验开始前应调用一次。"""
+    _SCORE_HISTORY.clear()
+    _GLOBAL_SCORE_BOUNDS.clear()
+    _CLEARED_STEPS.clear()
+
 
 def _get_layer_name(param_group):
     """辅助函数：统一获取层名称"""
@@ -245,20 +274,27 @@ def adjust_importance_criteria(param_group, bit_layers, full_precision=32, histo
         )
 
 
-def calculate_importance_score(criteria, param_group, bit_layers=None, step=None, smooth_factor=0.8):
+def calculate_importance_score(criteria, param_group, bit_layers=None, step=None,
+                               smooth_factor=0.8, online_normalize=None):
     """
     Args:
         step (int, optional): 当前训练步数
         smooth_factor (float): 校准因子混合比例，默认 0.8
+        online_normalize (bool, optional): 是否额外做在线 min-max 归一化。
+            默认 None -> 跟随 ONLINE_NORMALIZE_DEFAULT(默认 False, 对齐原版)。
     """
-    # --- [Bug Fix] 跨会话累积: step==0 或 step==1 时清理历史 ---
+    # --- 跨会话累积清理: step==0/1 时清理本层历史 ---
     # 避免多次训练复用同一进程时数据累积导致 CV 计算错误
     if step is not None and step <= 1:
         layer_name = _get_layer_name(param_group)
         if layer_name in _SCORE_HISTORY:
             _SCORE_HISTORY[layer_name] = {'steps': []}
-        if layer_name in _GLOBAL_SCORE_BOUNDS:
-            del _GLOBAL_SCORE_BOUNDS[layer_name]
+        # 【修复】_GLOBAL_SCORE_BOUNDS 的 key 是 criterion 名而非层名,
+        # 原写法 `if layer_name in _GLOBAL_SCORE_BOUNDS` 永远不成立 -> 跨实验污染。
+        # 正确做法是整体清空, 且同一 step 只清一次(否则后续 param_group 会抹掉已累积的边界)。
+        if step not in _CLEARED_STEPS:
+            _CLEARED_STEPS.add(step)
+            _GLOBAL_SCORE_BOUNDS.clear()
 
     param_group['importance_scores'] = dict()
     with torch.no_grad():
@@ -275,13 +311,15 @@ def calculate_importance_score(criteria, param_group, bit_layers=None, step=None
             elif 'taylor_second_order' == cri_name:
                 importance_score_by_second_order_taylor(param_group)
 
-    # 2. 记录原始分数到历史 (用于计算方差) 并绘图
-    # 注意：我们先记录 Raw Score，这样 adjust 函数才能读到当前步的数据来计算方差
+    # 2. 记录原始分数到历史 (用于 MCSS 计算方差) 并绘图
     _record_and_plot(param_group, step=step)
-    # 归一化
-    _apply_online_normalization(param_group)
 
-    # 3. MCSS 调整由调用方(优化器)显式触发, 避免与 _apply_kappa_wiring 重复调用
+    # 3. 在线 min-max 归一化 (默认关闭; 开启会与优化器的 Frobenius 归一化叠加)
+    flag = ONLINE_NORMALIZE_DEFAULT if online_normalize is None else online_normalize
+    if flag:
+        _apply_online_normalization(param_group)
+
+    # 4. MCSS 调整由调用方(优化器)显式触发, 避免与 _apply_kappa_wiring 重复调用
     #    导致 smooth_factor 叠加失真。见 base_hybrid_sparse_optimizer.compute_importance_scores
 
 

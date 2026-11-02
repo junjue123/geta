@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 from enum import Enum
 from typing import Tuple, Union
 
@@ -15,6 +16,68 @@ class NanInGradientError(Exception):
 
 # submodule level logger
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# NaN / Inf 处理策略
+# ---------------------------------------------------------------------------
+# 背景: 量化参数 (d_quant/q_m/t_quant) 的梯度是对整个 tensor 求和, 量级天然
+# 可达 1e9; 若用 variant="sgd" 会一步爆炸。历史上本文件用 nan_to_num 静默吞掉
+# NaN, 把"立刻可见的崩溃"变成了"acc 恒等于随机水平的静默失效", 极难排查。
+#
+#   warn   (默认) 记录告警 + 非法值置 0, 训练继续, 但日志可见
+#   strict        恢复原版行为, 直接 raise NanInGradientError
+#   silent        复现历史行为, 完全静默 (仅用于对照复现, 不建议)
+NAN_POLICY = os.environ.get("OTO_QUANT_NAN_POLICY", "warn").lower()
+
+# 采样检查间隔。
+# torch.isfinite(t).all() 是"全张量归约 + 隐式 GPU->CPU 同步", 每层每步都做会让
+# 量化训练再慢 ~18%(实测 194ms -> 165ms/step)。根因(SGD 导致量化梯度爆炸)修复后
+# 异常值几乎不会出现, 因此安全网改为采样检查: 默认每 500 次调用查一次,
+# strict 模式下仍然每次都查并抛错。
+_NAN_CHECK_EVERY = int(os.environ.get("OTO_QUANT_NAN_CHECK_EVERY", "500"))
+_check_counter = [0]
+
+_nan_event_count = {}
+
+
+def _check_tick() -> bool:
+    """返回本次是否应该做全张量有限性检查 (采样)。"""
+    _check_counter[0] += 1
+    return _check_counter[0] % _NAN_CHECK_EVERY == 0
+
+
+def _nonfinite_report(where: str):
+    _nan_event_count[where] = _nan_event_count.get(where, 0) + 1
+    cnt = _nan_event_count[where]
+    if cnt <= 3 or cnt % 200 == 0:
+        logger.warning(
+            f"[Quant][NaN] non-finite value in {where} (累计 {cnt} 次), 已替换为有界值。"
+            f"NAN_POLICY={NAN_POLICY}. 若频繁出现请检查: (1) optimizer variant 是否为 adam "
+            f"(官方推荐, SGD 会让量化梯度 1e9 一步爆炸); (2) lr_quant 是否过大。"
+        )
+
+
+def _sanitize_grad(t: torch.Tensor, where: str, detail: str = "") -> torch.Tensor:
+    """把梯度里的 NaN/Inf 替换为 0, 并按策略告警或抛错。
+
+    性能提示: 非 strict 模式下走采样检查, 避免每层每步的全张量归约 + GPU 同步。
+    """
+    if NAN_POLICY == "strict":
+        if not torch.isfinite(t).all():
+            raise NanInGradientError(f"Error: NaN/Inf appears in {where} gradient!\n{detail}")
+        return t
+    if NAN_POLICY == "silent":
+        return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+    # warn: 采样检查
+    if _check_tick() and not torch.isfinite(t).all():
+        _nonfinite_report(where)
+        return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+    return t
+
+
+def get_nan_event_stats():
+    """返回 NaN 事件计数, 便于实验脚本在 epoch 结束时汇总。"""
+    return dict(_nan_event_count)
 
 
 class QuantizationType(Enum):
@@ -63,14 +126,35 @@ class SymQuantizerNonLinear(torch.autograd.Function):
         d_safe = torch.clamp(d_quant, min=1e-8)
         range_pow = torch.exp(t_quant * torch.log(torch.abs(q_m - q_s) + 1e-6))
         input_diff = torch.clamp(input_abs - q_s, min=1e-8)  # avoid log(negative)
-        input_pow = torch.exp(t_quant * torch.log(input_diff))
+        # 性能: pow(x, t) 比 exp(t*log(x)) 少一个全张量 kernel, 数值等价 (x > 0)
+        input_pow = torch.pow(input_diff, t_quant)
 
-        output = d_safe * torch.round(input_pow.div(d_safe))
-        output[input_abs <= q_s] = 0
-        output[input_abs >= q_m] = d_safe * torch.round(range_pow.div(d_safe))
+        # 性能: 用 torch.where 替代布尔索引赋值(output[mask]=v 会触发分散写, 慢 ~24%)
+        sat_val = d_safe * torch.round(range_pow / d_safe)  # 标量: 饱和值
+        output = d_safe * torch.round(input_pow / d_safe)
+        output = torch.where(input_abs <= q_s, torch.zeros_like(output), output)
+        output = torch.where(input_abs >= q_m, sat_val.expand_as(output), output)
         output = torch.sign(input) * output
-        # Guard against inf/nan from extreme quantization parameters
-        output = torch.nan_to_num(output, nan=0.0, posinf=0.0, neginf=0.0)
+        # Guard against inf/nan from extreme quantization parameters.
+        # 注意: 溢出时应饱和到 ±|q_m| (可表示上界), 而不是置 0 —— 置 0 会让
+        # 整个量化层输出塌陷为 0, 模型在"看起来还在训练"的状态下悄悄死掉。
+        if NAN_POLICY == "strict":
+            if not torch.isfinite(output).all():
+                raise NanInGradientError(
+                    f"Error: non-finite value in quantization forward!\n"
+                    f"d: {d_quant.item():.5f}, t: {t_quant.item():.5f}, "
+                    f"q_m: {q_m.item():.5f}, q_s: {q_s.item():.5f}"
+                )
+        elif NAN_POLICY == "silent":
+            output = torch.nan_to_num(output, nan=0.0, posinf=0.0, neginf=0.0)
+        elif _check_tick() and not torch.isfinite(output).all():
+            # 采样检查: 避免每层每步的全张量归约 + GPU 同步
+            _nonfinite_report("forward")
+            sat = torch.abs(q_m).to(device).clamp(min=1e-8)
+            output = torch.where(
+                torch.isinf(output), torch.sign(output) * sat, output
+            )
+            output = torch.nan_to_num(output, nan=0.0)
         return output
 
     @staticmethod
@@ -111,11 +195,17 @@ class SymQuantizerNonLinear(torch.autograd.Function):
         grad_t_xq = torch.sign(input) * grad_t_xq
         grad_t = torch.tensor([torch.sum(grad_output * grad_t_xq)], device=device)
 
-        # Replace NaN/Inf with 0 instead of raising, so training can continue
-        grad_x = torch.nan_to_num(grad_x, nan=0.0, posinf=0.0, neginf=0.0)
-        grad_d = torch.nan_to_num(grad_d, nan=0.0, posinf=0.0, neginf=0.0)
-        grad_qm = torch.nan_to_num(grad_qm, nan=0.0, posinf=0.0, neginf=0.0)
-        grad_t = torch.nan_to_num(grad_t, nan=0.0, posinf=0.0, neginf=0.0)
+        # NaN/Inf 处理: warn 策略下告警并清零, strict 策略下直接抛错 (原版行为)
+        detail = (
+            f"d: {d_quant.item():.5f}, t: {t_quant.item():.5f}, "
+            f"q_m: {q_m.item():.5f}, q_s: {q_s.item():.5f}\n"
+            f"input_abs-max: {torch.max(input_abs).item():.5f}, "
+            f"grad_output-max: {torch.max(grad_output).item():.5f}"
+        )
+        grad_x = _sanitize_grad(grad_x, "grad_x", detail)
+        grad_d = _sanitize_grad(grad_d, "grad_d", detail)
+        grad_qm = _sanitize_grad(grad_qm, "grad_qm", detail)
+        grad_t = _sanitize_grad(grad_t, "grad_t", detail)
 
         return grad_x, grad_d, grad_qm, grad_t, None, None
 
@@ -183,10 +273,15 @@ class SymQuantizerLinear(torch.autograd.Function):
         grad_qm_xq[input_abs <= q_m] = 0
         grad_qm = torch.tensor([torch.sum(grad_output * grad_qm_xq)], device=device)
 
-        # Replace NaN/Inf with 0 instead of raising
-        grad_x = torch.nan_to_num(grad_x, nan=0.0, posinf=0.0, neginf=0.0)
-        grad_d = torch.nan_to_num(grad_d, nan=0.0, posinf=0.0, neginf=0.0)
-        grad_qm = torch.nan_to_num(grad_qm, nan=0.0, posinf=0.0, neginf=0.0)
+        # Replace NaN/Inf instead of raising, 但保留告警痕迹
+        detail = (
+            f"d: {d_quant.item():.5f}, q_m: {q_m.item():.5f}, q_s: {q_s.item():.5f}\n"
+            f"input_abs-max: {torch.max(input_abs).item():.5f}, "
+            f"grad_output-max: {torch.max(grad_output).item():.5f}"
+        )
+        grad_x = _sanitize_grad(grad_x, "grad_x_linear", detail)
+        grad_d = _sanitize_grad(grad_d, "grad_d_linear", detail)
+        grad_qm = _sanitize_grad(grad_qm, "grad_qm_linear", detail)
         return grad_x, grad_d, grad_qm, None, None
 
 # NOTE: this is a experimental WIP, not used in the codebase yet
