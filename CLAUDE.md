@@ -96,6 +96,43 @@ oto.construct_subnet(out_dir='./')
 - `test_scripts/`: Extended test scripts for various architectures
 - `tools/`: Visualization utilities
 
+## Training Entry & Configs
+
+**唯一正式入口是 `train.py`，所有配置都在 YAML 里改。**
+
+```bash
+python train.py configs/compare_resnet20.yaml      # 正式跑
+python train.py configs/compare_vgg7.yaml          # 换模型只改 yaml 的 model
+python train.py configs/xxx.yaml --modes daco      # 换算法只改 modes
+python train.py configs/xxx.yaml --quick-test      # 冒烟: 1 epoch, 无 warmup/cooldown
+```
+
+优先级：**命令行 > YAML > 脚本内置默认值**。运行开始会把最终生效的完整配置快照到
+`{out}/run_config.yaml`，便于事后回溯。
+
+### 常用改动都在 YAML 内
+
+| 想改什么 | 改哪个字段 | 取值 |
+| --- | --- | --- |
+| 换模型 | `model` | `resnet20` / `vgg7` |
+| 换算法 | `modes` | `baseline`（纯 GETA）/ `daco`（余弦剪枝）/ `baseline,daco`（对比） |
+| 量化模式 | `quant_mode` | `weight_and_activation` / `weight_only` |
+| 三段调度 | `warmup_epochs` / `epochs` / `cooldown_epochs` | warmup 纯 SGD → joint 剪枝降位宽 → cooldown 冻结结构 finetune |
+| 优化器 | `variant` / `lr` / `lr_quant` / `weight_decay` | 必须用 `adam`：量化参数量级 ~1e9，sgd 会一步爆炸 |
+| 剪枝形状 | `prune_shape` / `prune_floor` / `prune_budget` | DACO 用 `cosine`，baseline 恒为 `linear` |
+| 压缩目标 | `compression.*` | `target_group_sparsity` / `bit_reduction` / 位宽上下界 / `kappa` / `beta_p` 等 |
+| 数据集 | `dataset.*` | 路径、batch size、归一化、增强 |
+| 输出 | `out` / `ckpt_every` | 结果目录与存档频率 |
+
+新增一个实验：复制 `configs/compare_resnet20.yaml`，改 `model` / `modes` / 超参即可，
+不需要写新脚本。
+
+### 已弃用的入口
+
+- `run_daco_cifar10.py`：旧训练入口，其 `cooldown_epochs` 已并入 `train.py`；
+  仅保留用于 `--hparam/--hvalue` 超参扫描的历史复现。旧配置在 `configs/legacy/` 下。
+- `configs/legacy/*.yaml`：给旧入口用的格式，不要用于新实验。
+
 ## Commit Message Convention
 
 每次提交必须遵循 `[<type>] <subject>` 格式：方括号内为改动类型，空一格后写描述。

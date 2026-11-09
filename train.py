@@ -859,7 +859,10 @@ def run_experiment(args, mode):
 
     warmup = 0 if args.quick_test else args.warmup_epochs
     joint = args.epochs
-    total = warmup + joint
+    # cooldown: 剪枝与位宽下降全部结束后, 固定的压缩结构上只做 finetune。
+    # 与 run_daco_cifar10 的 warmup/joint/cooldown 三段调度保持一致。
+    cooldown = 0 if args.quick_test else getattr(args, "cooldown_epochs", 0)
+    total = warmup + joint + cooldown
     # baseline 必须是纯 GETA: 固定预算 + 不调用 RCAJS, 否则 exp(-βΔ)/Ψ 仍会
     # 改变剪枝节奏, 两边稀疏度就不再逐期一致。
     # DACO 的调度差异体现在预算数组的"形状"上(余弦 前多后少), 而不是让 rcaJS
@@ -912,7 +915,9 @@ def run_experiment(args, mode):
     t0 = time.time()
 
     for ep in range(start_ep, total):
-        phase = "warmup" if ep < warmup else "joint"
+        phase = ("warmup" if ep < warmup
+                 else "joint" if ep < warmup + joint
+                 else "cooldown")
         t_ep = time.time()
         tr_loss, tr_acc = train_one_epoch(
             model, opt, trainloader, criterion, device, ep+1, scheduler)
@@ -1043,7 +1048,8 @@ def save_result(result, out_dir):
 # yaml 顶层键 → argparse dest
 _YAML_TO_ARG = {
     "model": "model", "modes": "modes", "epochs": "epochs",
-    "warmup_epochs": "warmup_epochs", "seed": "seed", "out": "out",
+    "warmup_epochs": "warmup_epochs", "cooldown_epochs": "cooldown_epochs",
+    "seed": "seed", "out": "out",
     "ckpt_every": "ckpt_every", "lr": "lr", "variant": "variant",
     "lr_eta_min_ratio": "lr_eta_min_ratio",
     "prune_shape": "prune_shape", "prune_floor": "prune_floor",
@@ -1169,6 +1175,9 @@ def main():
     p.add_argument("--epochs", type=int, default=85,
                    help="joint 训练 epochs (默认 85, 配合 warmup 15 = 100 总)")
     p.add_argument("--warmup-epochs", type=int, default=15)
+    p.add_argument("--cooldown-epochs", type=int, default=0,
+                   help="cooldown 阶段 epochs: 剪枝与位宽下降结束后只做 finetune "
+                        "(默认 0; 需要复现 run_daco_cifar10 的 10+200+20 调度时设 20)")
     p.add_argument("--data-dir", default="datasets/cifar10")
     p.add_argument("--out", default="outputs/baseline_vs_daco")
     p.add_argument("--root", default=None,

@@ -1,6 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
+[已弃用 / DEPRECATED]
+  正式训练请统一走唯一入口: python train.py configs/<name>.yaml
+  本脚本仅保留用于历史实验复现（尤其是 --hparam/--hvalue 超参扫描）。
+  它独有的 cooldown_epochs 已迁移到 train.py:
+      python train.py configs/xxx.yaml --cooldown-epochs 20
+  或写在 yaml 顶层: cooldown_epochs: 20
+  旧配置已移到 configs/legacy/ 下，新配置见 configs/compare_*.yaml。
+
 DACO CIFAR-10 真实训练 + 超参数敏感性实验
 ==========================================
 

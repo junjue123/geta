@@ -1,0 +1,94 @@
+# Baseline(纯 GETA, 阶梯剪枝) vs DACO(余弦剪枝) 正式对比配置
+#
+# 用法:
+#   python train.py configs/compare_resnet20.yaml
+#   python train.py configs/compare_resnet20.yaml --quick-test   # 临时覆盖
+#
+# 优先级: 命令行 > 本文件 > 脚本内置默认值
+# 运行开始时会把「最终生效的全部配置」快照到 {out}/run_config.yaml,
+# 日志同时写终端与 {out}/train.log(可用 logging.file 改), 便于事后回溯。
+
+model: resnet20
+modes: baseline,daco
+quant_mode: weight_and_activation   # 论文对比用 weight_and_activation
+
+# ===== 训练调度 =====
+epochs: 85            # joint 阶段; 与 warmup 15 合计 100
+warmup_epochs: 15
+seed: 1
+deterministic: false
+lr: 0.001
+lr_eta_min_ratio: 0.01   # 余弦终点 = lr*0.01 = 1e-5; 设 1.0 会让退火失效
+variant: adam            # 必须 adam: 量化参数梯度量级 ~1e9, sgd 会一步爆炸
+
+# ===== 数据 =====
+dataset:
+  data_dir: datasets/cifar10
+  batch_size: 128
+  num_workers: 4
+  eval_batch_size: 256
+  normalization:            # CIFAR-10 统计量
+    mean: [0.4914, 0.4822, 0.4465]
+    std: [0.2023, 0.1994, 0.2010]
+  augmentation:
+    random_crop_padding: 4  # 0 = 关闭随机裁剪
+    random_horizontal_flip: true
+
+# ===== 优化器细项 =====
+optimizer:
+  lr_quant: 0.001         # 量化参数学习率 (d_quant / q_m / t_quant)
+  weight_decay: 0.0001
+  importance_criteria: default   # OTO 内置重要性打分组合
+  projection_periods: 1
+  projection_steps: 1
+  pruning_steps: 1
+
+# ===== 类别原型 (t-SNE 轨迹用) =====
+prototypes:
+  max_samples: 2000       # 每 epoch 固定取前 N 个样本, 保证跨 epoch 可比
+
+# ===== 调试开关 (等价于命令行 --random-data / --quick-test) =====
+debug:
+  random_data: false
+  quick_test: false
+  legacy_data: false
+
+# ===== 输出 =====
+out: outputs/framework_compare
+ckpt_every: 10
+
+# ===== 剪枝调度 =====
+prune_shape: cosine   # 仅作用于 DACO; baseline 恒为 linear 阶梯
+prune_floor: 0.0      # 0 = 最后一期刚好剪到 0.5, 之后不再剪
+prune_budget: fixed   # 由预算数组驱动。rcajs 会让 0.08*448=36 组/期, 7 期剪满, 勿用
+
+# ===== 日志 =====
+logging:
+  level: info         # debug 会打出 MCSS 每层每 criterion 明细(一次剪枝上百行)
+  # file 留空则自动跟随 out -> {out}/train.log, 便于换 out 时日志不串档
+  # file: outputs/framework_compare/train.log
+
+# ===== 压缩超参 (对齐 DACO.tex L385-387) =====
+compression:
+  target_group_sparsity: 0.5
+  bit_reduction: 1
+  min_bit_wt: 4       # b_ε
+  max_bit_wt: 16
+  min_bit_act: 2      # b_ε^act
+  max_bit_act: 16
+  phi_b_threshold: 0.9   # 权重位宽收缩阈值
+  phi_a_threshold: 0.9   # 激活位宽收缩阈值 (新增: 原先 max_bit_act 从不下降)
+  kappa: 0.5          # MCSS
+  W: 5
+  beta_p: 1.0         # RCAJS Lagrangian 增益
+  diffusion_noise_init: 0.0001   # DGD
+  diffusion_noise_ratio: 0.5
+
+# ===== baseline 关断项 (纯 GETA: 无 RCAJS 自适应 / MCSS / DGD) =====
+baseline_override:
+  phi_b_threshold: 1.0
+  phi_a_threshold: 1.0
+  beta_p: 0.0
+  kappa: 0.0
+  diffusion_noise_init: 0.0
+  diffusion_noise_ratio: 0.0
