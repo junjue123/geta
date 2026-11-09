@@ -2,7 +2,7 @@ import logging
 import math
 import os
 from enum import Enum
-from typing import Tuple, Union
+from typing import Callable, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -57,14 +57,23 @@ def _nonfinite_report(where: str):
         )
 
 
-def _sanitize_grad(t: torch.Tensor, where: str, detail: str = "") -> torch.Tensor:
+def _sanitize_grad(
+    t: torch.Tensor,
+    where: str,
+    detail: Union[str, Callable[[], str]] = "",
+) -> torch.Tensor:
     """把梯度里的 NaN/Inf 替换为 0, 并按策略告警或抛错。
 
     性能提示: 非 strict 模式下走采样检查, 避免每层每步的全张量归约 + GPU 同步。
+
+    detail 可以传字符串, 也可以传 callable。传 callable 时只在真正命中
+    NaN/Inf 需要报错或告警时才求值 —— 拼 detail 里的 .item() / torch.max()
+    都会触发 GPU 同步, 无条件构造会让整个 backward 退化成同步流水线。
     """
     if NAN_POLICY == "strict":
         if not torch.isfinite(t).all():
-            raise NanInGradientError(f"Error: NaN/Inf appears in {where} gradient!\n{detail}")
+            msg = detail() if callable(detail) else detail
+            raise NanInGradientError(f"Error: NaN/Inf appears in {where} gradient!\n{msg}")
         return t
     if NAN_POLICY == "silent":
         return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
@@ -212,16 +221,19 @@ class SymQuantizerNonLinear(torch.autograd.Function):
         grad_t = (gs * grad_t_xq).sum().reshape(1)
 
         # NaN/Inf 处理: warn 策略下告警并清零, strict 策略下直接抛错 (原版行为)
-        detail = (
-            f"d: {d_quant.item():.5f}, t: {t_quant.item():.5f}, "
-            f"q_m: {q_m.item():.5f}, q_s: {q_s.item():.5f}\n"
-            f"input_abs-max: {torch.max(input_abs).item():.5f}, "
-            f"grad_output-max: {torch.max(grad_output).item():.5f}"
-        )
-        grad_x = _sanitize_grad(grad_x, "grad_x", detail)
-        grad_d = _sanitize_grad(grad_d, "grad_d", detail)
-        grad_qm = _sanitize_grad(grad_qm, "grad_qm", detail)
-        grad_t = _sanitize_grad(grad_t, "grad_t", detail)
+        # 性能: detail 改为惰性求值, 只在真出问题时才做 .item()/max() 同步
+        def _detail():
+            return (
+                f"d: {d_quant.item():.5f}, t: {t_quant.item():.5f}, "
+                f"q_m: {q_m.item():.5f}, q_s: {q_s.item():.5f}\n"
+                f"input_abs-max: {torch.max(input_abs).item():.5f}, "
+                f"grad_output-max: {torch.max(grad_output).item():.5f}"
+            )
+
+        grad_x = _sanitize_grad(grad_x, "grad_x", _detail)
+        grad_d = _sanitize_grad(grad_d, "grad_d", _detail)
+        grad_qm = _sanitize_grad(grad_qm, "grad_qm", _detail)
+        grad_t = _sanitize_grad(grad_t, "grad_t", _detail)
 
         return grad_x, grad_d, grad_qm, grad_t, None, None
 
@@ -290,14 +302,17 @@ class SymQuantizerLinear(torch.autograd.Function):
         grad_qm = torch.tensor([torch.sum(grad_output * grad_qm_xq)], device=device)
 
         # Replace NaN/Inf instead of raising, 但保留告警痕迹
-        detail = (
-            f"d: {d_quant.item():.5f}, q_m: {q_m.item():.5f}, q_s: {q_s.item():.5f}\n"
-            f"input_abs-max: {torch.max(input_abs).item():.5f}, "
-            f"grad_output-max: {torch.max(grad_output).item():.5f}"
-        )
-        grad_x = _sanitize_grad(grad_x, "grad_x_linear", detail)
-        grad_d = _sanitize_grad(grad_d, "grad_d_linear", detail)
-        grad_qm = _sanitize_grad(grad_qm, "grad_qm_linear", detail)
+        # 性能: detail 改为惰性求值, 避免每层每步 3 次 .item() + 2 次 max 同步
+        def _detail():
+            return (
+                f"d: {d_quant.item():.5f}, q_m: {q_m.item():.5f}, q_s: {q_s.item():.5f}\n"
+                f"input_abs-max: {torch.max(input_abs).item():.5f}, "
+                f"grad_output-max: {torch.max(grad_output).item():.5f}"
+            )
+
+        grad_x = _sanitize_grad(grad_x, "grad_x_linear", _detail)
+        grad_d = _sanitize_grad(grad_d, "grad_d_linear", _detail)
+        grad_qm = _sanitize_grad(grad_qm, "grad_qm_linear", _detail)
         return grad_x, grad_d, grad_qm, None, None
 
 # NOTE: this is a experimental WIP, not used in the codebase yet
