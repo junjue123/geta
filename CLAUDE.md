@@ -135,8 +135,10 @@ geta-main_origin/
 ├── configs/              # YAML 配置 (正式) + legacy/ (旧格式)
 ├── only_train_once/      # 核心框架包 (optimizer / quantization / graph / distillation ...)
 ├── sanity_check/         # 测试后端与模型定义
-├── scripts/              # 工具脚本: 诊断 diag_*, 测试 run_*_test, 出图 plot_*,
-│                         #          性能 profile_*, 数据下载, CR 统计等
+├── scripts/              # 工具脚本: 诊断 diag_*, 测试 run_*_test, 性能 profile_*,
+│                         #          超参扫描, 数据下载, CR 统计等
+├── tools/                # 可视化与出图: plot_framework_compare, plot_baseline_vs_daco,
+│                         #              collect_results, make_picture*
 ├── deployment/           # cuda_kernels/ (生成的 CUDA 核) + frontend/ (配置 UI)
 ├── cloud_autodl/         # 云端训练脚本
 ├── docs/                 # 实验报告与说明 (本地 *.md 规则下不入库)
