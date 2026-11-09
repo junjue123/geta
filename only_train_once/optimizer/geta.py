@@ -947,20 +947,13 @@ class GETA(BaseHybridSparseOptimizer):
                     if "q_m_wt" in p_name:
                         q_m_wt = p.data
 
-            # Calculate bounds for this layer
+            # Calculate bounds for this layer (0 维张量, 无需 .item() 同步)
             d_quant_min = self._d_quant_helper(self.max_bit_wt, q_m_wt, t_quant_wt)
             d_quant_max = self._d_quant_helper(self.min_bit_wt, q_m_wt, t_quant_wt)
-
-            # Convert bounds to scalars if they're tensors
-            if isinstance(d_quant_min, torch.Tensor):
-                d_quant_min = float(d_quant_min.item())
-            if isinstance(d_quant_max, torch.Tensor):
-                d_quant_max = float(d_quant_max.item())
 
             # Apply bounds to d_quant parameters
             for p_name, p in zip(param_group["p_names"], param_group["params"]):
                 if layer_name in p_name and "d_quant_wt" in p_name:
-                    # Clip using scalar bounds
                     p.data.clamp_(min=d_quant_min, max=d_quant_max)
 
     def partial_projected_gradient_descent_step_range_act(self, param_group):
@@ -1017,7 +1010,8 @@ class GETA(BaseHybridSparseOptimizer):
                 if layer_name in p_name and "d_quant_act" in p_name:
                     d_quant_min = self._d_quant_helper(max_bit, q_m_act, t_quant_act)
                     d_quant_max = self._d_quant_helper(min_bit, q_m_act, t_quant_act)
-                    p.data = torch.clip(p.data, min=d_quant_min, max=d_quant_max)
+                    # 性能: 原地 clamp, 避免每步给参数重新分配张量
+                    p.data.clamp_(min=d_quant_min, max=d_quant_max)
 
     def partial_projected_gradient_descent_step_fix(self, param_group, bit_dict):
         for p_name, p in zip(param_group["p_names"], param_group["params"]):
@@ -1064,11 +1058,12 @@ class GETA(BaseHybridSparseOptimizer):
                 if layer_name in p_name and "d_quant_wt" in p_name:
                     bit_width = bit_dict[layer_name]["weight"]
                     d_quant_wt = self._d_quant_helper(bit_width, q_m_wt, t_quant_wt)
-                    p.data = torch.clip(p.data, min=d_quant_wt, max=d_quant_wt)
+                    # 性能: 原地 clamp, 避免每步给参数重新分配张量
+                    p.data.clamp_(min=d_quant_wt, max=d_quant_wt)
                 if layer_name in p_name and "d_quant_act" in p_name:
                     bit_width = bit_dict[layer_name]["activation"]
                     d_quant_act = self._d_quant_helper(bit_width, q_m_act, t_quant_act)
-                    p.data = torch.clip(p.data, min=d_quant_act, max=d_quant_act)
+                    p.data.clamp_(min=d_quant_act, max=d_quant_act)
 
     @staticmethod
     def _bit_width_helper(d_quant=None, q_m=None, t_quant=None):
@@ -1088,27 +1083,35 @@ class GETA(BaseHybridSparseOptimizer):
 
     @staticmethod
     def _d_quant_helper(bit_width, q_m, t_quant):
-        """Calculate d_quant, using max absolute value of q_m for uniform quantization."""
-        if t_quant is None:
-            t_quant = 1.0
+        """Calculate d_quant, using max absolute value of q_m for uniform quantization.
 
-        # Get maximum absolute value if q_m is a tensor
-        if isinstance(q_m, torch.Tensor):
-            q_m = torch.max(torch.abs(q_m)).item()
-        else:
-            q_m = abs(q_m)
-        # Prevent exact zero
-        q_m = max(abs(q_m), 1e-10)
-
-        # Calculate d_quant using scalar math
-        # Clamp exponent to avoid math.exp overflow
-        exponent = t_quant * math.log(abs(q_m))
-        exponent = max(min(exponent, 50.0), -50.0)
+        性能: q_m 是 GPU 张量时全程张量运算并返回 0 维张量, 不做 .item()。
+        joint 阶段每层每步要算 4 次, 20 层 × 13 参数组 = 上千次 .item(),
+        等于上千次 GPU 强制同步。返回张量后可直接喂给 clamp_/clip 的 min/max。
+        q_m 是 python / numpy 标量时仍返回 float, 供控制流比较使用。
+        """
         # 防御: bit_width==1 时 (2**0 - 1)=0 会触发 ZeroDivisionError，
         #       钳制分母使用的有效位宽下限为 2 (与 min_bit_wt 一致)。
         eff_bw = max(bit_width, 2)
-        d_quant = math.exp(exponent) / (2 ** (eff_bw - 1) - 1)
-        return d_quant
+        denom = 2 ** (eff_bw - 1) - 1
+
+        if isinstance(q_m, torch.Tensor):
+            t = 1.0 if t_quant is None else t_quant
+            if isinstance(t, torch.Tensor):
+                t = t.reshape(()) if t.numel() == 1 else t.max()
+            q_abs = torch.abs(q_m)
+            q_abs = q_abs.reshape(()) if q_abs.numel() == 1 else q_abs.max()
+            q_abs = q_abs.clamp(min=1e-10)
+            # Clamp exponent to avoid exp overflow
+            exponent = (t * torch.log(q_abs)).clamp(-50.0, 50.0)
+            return (torch.exp(exponent) / denom).reshape(())
+
+        if t_quant is None:
+            t_quant = 1.0
+        q_m = max(abs(q_m), 1e-10)
+        exponent = t_quant * math.log(abs(q_m))
+        exponent = max(min(exponent, 50.0), -50.0)
+        return math.exp(exponent) / denom
 
     @staticmethod
     def _quantize_helper(weight, d_quant, q_m, t_quant):
