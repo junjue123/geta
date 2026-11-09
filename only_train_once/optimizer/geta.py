@@ -867,6 +867,58 @@ class GETA(BaseHybridSparseOptimizer):
 
         return bit_dict
 
+    def _param_cache(self, param_group):
+        """按 p_names 缓存「参数分类」与「layer -> 参数索引」映射。
+
+        joint 阶段原实现是 `for layer_name: for p_name: if layer_name in p_name`,
+        20 个量化层 × 197 个参数 × 每步多次遍历 ≈ 10 万次字符串子串匹配。
+        这里以 tuple(p_names) 为键缓存, 剪枝重建 param_groups 后键变化自动失效。
+        """
+        key = tuple(param_group["p_names"])
+        store = self.__dict__.setdefault("_param_cache_store", {})
+        cache = store.get(key)
+        if cache is not None:
+            return cache
+
+        layers = {}
+        wt_q_idx, act_q_idx = [], []
+        for i, p_name in enumerate(param_group["p_names"]):
+            head, sep, tag = p_name.rpartition(".")
+            if not sep:
+                continue
+            layer = layers.get(head)
+            if layer is None:
+                layer = layers[head] = {}
+            if tag == "d_quant_wt":
+                layer["d_wt"] = i
+                wt_q_idx.append(i)
+            elif tag == "t_quant_wt":
+                layer["t_wt"] = i
+                wt_q_idx.append(i)
+            elif tag == "q_m_wt":
+                layer["qm_wt"] = i
+                wt_q_idx.append(i)
+            elif tag == "d_quant_act":
+                layer["d_act"] = i
+                act_q_idx.append(i)
+            elif tag == "t_quant_act":
+                layer["t_act"] = i
+                act_q_idx.append(i)
+            elif tag == "q_m_act":
+                layer["qm_act"] = i
+                act_q_idx.append(i)
+
+        cache = {
+            # 只保留含量化步长的层, 其余(纯 weight/bias)无需投影
+            "layers": {k: v for k, v in layers.items() if "d_wt" in v or "d_act" in v},
+            "wt_q_idx": frozenset(wt_q_idx),
+            "act_q_idx": frozenset(act_q_idx),
+        }
+        if len(store) > 8:
+            store.clear()
+        store[key] = cache
+        return cache
+
     def gradient_descent_step(self, param_group):
         for p_name, p in zip(param_group["p_names"], param_group["params"]):
             if p_name not in param_group["grad_variant"]:
@@ -896,174 +948,110 @@ class GETA(BaseHybridSparseOptimizer):
 
     def partial_projected_gradient_descent_step_range_wt(self, param_group):
         """Apply projected gradient descent for weight quantization parameters."""
-        # First part remains the same - gradient descent step
-        for p_name, p in zip(param_group["p_names"], param_group["params"]):
-            if p_name not in param_group["grad_variant"]:
+        params = param_group["params"]
+        grads = param_group["grad_variant"]
+        lr, lr_quant = param_group["lr"], param_group["lr_quant"]
+        wd = param_group["weight_decay"]
+        apply_wd = wd is not None and param_group["variant"] == "adamw"
+
+        cache = self._param_cache(param_group)
+        wt_q_idx = cache["wt_q_idx"]
+
+        # 性能: 参数类型预索引, 不再逐参数做 3 次字符串子串匹配
+        for i, p_name in enumerate(param_group["p_names"]):
+            g = grads.get(p_name)
+            if g is None:
                 continue
-            if (
-                param_group["weight_decay"] is not None
-                and param_group["variant"] == "adamw"
-            ):
-                if (
-                    "d_quant_wt" in p_name
-                    or "t_quant_wt" in p_name
-                    or "q_m_wt" in p_name
-                ):
-                    p.data.add_(
-                        param_group["weight_decay"] * p.data,
-                        alpha=-param_group["lr_quant"],
-                    )
-                else:
-                    p.data.add_(
-                        param_group["weight_decay"] * p.data, alpha=-param_group["lr"]
-                    )
+            p = params[i]
+            step_lr = lr_quant if i in wt_q_idx else lr
+            if apply_wd:
+                p.data.add_(wd * p.data, alpha=-step_lr)
+            p.data.add_(g, alpha=-step_lr)
 
-            # Assign different learning rate to weights and quantization params
-            if "d_quant_wt" in p_name or "t_quant_wt" in p_name or "q_m_wt" in p_name:
-                p.data.add_(
-                    param_group["grad_variant"][p_name], alpha=-param_group["lr_quant"]
-                )
-            else:
-                p.data.add_(
-                    param_group["grad_variant"][p_name], alpha=-param_group["lr"]
-                )
-
-        # Find layers in each param_group
-        layer_name_list = []
-        for p_name in param_group["p_names"]:
-            if "d_quant_wt" not in p_name:
+        # Projection: 直接按 layer 索引取 q_m / t_quant, 无需嵌套扫描
+        for idx in cache["layers"].values():
+            i_d = idx.get("d_wt")
+            if i_d is None or "qm_wt" not in idx:
                 continue
-            layer_name = ".".join(p_name.split(".")[:-1])
-            if layer_name not in layer_name_list:
-                layer_name_list.append(layer_name)
-
-        # Projection
-        for layer_name in layer_name_list:
-            t_quant_wt = None
-            for p_name, p in zip(param_group["p_names"], param_group["params"]):
-                if layer_name in p_name:
-                    if "t_quant_wt" in p_name:
-                        t_quant_wt = p.data
-                    if "q_m_wt" in p_name:
-                        q_m_wt = p.data
-
-            # Calculate bounds for this layer (0 维张量, 无需 .item() 同步)
+            q_m_wt = params[idx["qm_wt"]].data
+            t_quant_wt = params[idx["t_wt"]].data if "t_wt" in idx else None
             d_quant_min = self._d_quant_helper(self.max_bit_wt, q_m_wt, t_quant_wt)
             d_quant_max = self._d_quant_helper(self.min_bit_wt, q_m_wt, t_quant_wt)
-
-            # Apply bounds to d_quant parameters
-            for p_name, p in zip(param_group["p_names"], param_group["params"]):
-                if layer_name in p_name and "d_quant_wt" in p_name:
-                    p.data.clamp_(min=d_quant_min, max=d_quant_max)
+            params[i_d].data.clamp_(min=d_quant_min, max=d_quant_max)
 
     def partial_projected_gradient_descent_step_range_act(self, param_group):
         # Add them as hyperparameter in hesso_quant optimizer in the future
         min_bit = self.min_bit_act
         max_bit = self.max_bit_act
 
-        for p_name, p in zip(param_group["p_names"], param_group["params"]):
-            if p_name not in param_group["grad_variant"]:
+        params = param_group["params"]
+        names = param_group["p_names"]
+        grads = param_group["grad_variant"]
+        lr_quant = param_group["lr_quant"]
+        wd = param_group["weight_decay"]
+        apply_wd = wd is not None and param_group["variant"] == "adamw"
+
+        cache = self._param_cache(param_group)
+
+        # 性能: 只更新激活量化参数, 用预索引替代 3 次字符串子串匹配
+        for i in cache["act_q_idx"]:
+            g = grads.get(names[i])
+            if g is None:
                 continue
-            if (
-                param_group["weight_decay"] is not None
-                and param_group["variant"] == "adamw"
-            ):
-                if (
-                    "d_quant_act" in p_name
-                    or "t_quant_act" in p_name
-                    or "q_m_act" in p_name
-                ):
-                    p.data.add_(
-                        param_group["weight_decay"] * p.data,
-                        alpha=-param_group["lr_quant"],
-                    )
+            p = params[i]
+            if apply_wd:
+                p.data.add_(wd * p.data, alpha=-lr_quant)
+            p.data.add_(g, alpha=-lr_quant)
 
-            # Assign learning rate to activation quantization params
-            if (
-                "d_quant_act" in p_name
-                or "t_quant_act" in p_name
-                or "q_m_act" in p_name
-            ):
-                p.data.add_(
-                    param_group["grad_variant"][p_name], alpha=-param_group["lr_quant"]
-                )
-
-        # Find layers in each param_group
-        layer_name_list = []
-        for p_name in param_group["p_names"]:
-            if "d_quant_act" not in p_name:
+        # Projection: 按 layer 索引直接取 q_m_act / t_quant_act
+        for idx in cache["layers"].values():
+            i_d = idx.get("d_act")
+            if i_d is None or "qm_act" not in idx:
                 continue
-            layer_name = ".".join(p_name.split(".")[:-1])
-            if layer_name not in layer_name_list:
-                layer_name_list.append(layer_name)
-
-        # Projection
-        for layer_name in layer_name_list:
-            t_quant_act = None
-            for p_name, p in zip(param_group["p_names"], param_group["params"]):
-                if layer_name in p_name:
-                    if "t_quant_act" in p_name:
-                        t_quant_act = p.data
-                    if "q_m_act" in p_name:
-                        q_m_act = p.data
-            for p_name, p in zip(param_group["p_names"], param_group["params"]):
-                if layer_name in p_name and "d_quant_act" in p_name:
-                    d_quant_min = self._d_quant_helper(max_bit, q_m_act, t_quant_act)
-                    d_quant_max = self._d_quant_helper(min_bit, q_m_act, t_quant_act)
-                    # 性能: 原地 clamp, 避免每步给参数重新分配张量
-                    p.data.clamp_(min=d_quant_min, max=d_quant_max)
+            q_m_act = params[idx["qm_act"]].data
+            t_quant_act = params[idx["t_act"]].data if "t_act" in idx else None
+            d_quant_min = self._d_quant_helper(max_bit, q_m_act, t_quant_act)
+            d_quant_max = self._d_quant_helper(min_bit, q_m_act, t_quant_act)
+            params[i_d].data.clamp_(min=d_quant_min, max=d_quant_max)
 
     def partial_projected_gradient_descent_step_fix(self, param_group, bit_dict):
-        for p_name, p in zip(param_group["p_names"], param_group["params"]):
-            if p_name not in param_group["grad_variant"]:
+        params = param_group["params"]
+        names = param_group["p_names"]
+        grads = param_group["grad_variant"]
+        lr, lr_quant = param_group["lr"], param_group["lr_quant"]
+        wd = param_group["weight_decay"]
+        apply_wd = wd is not None and param_group["variant"] == "adamw"
+
+        cache = self._param_cache(param_group)
+        # 注意: fix 阶段判据是 "d_quant"/"t_quant"/"q_m"(不带 _wt/_act),
+        # 权重与激活的量化参数一起走 lr_quant, 故取并集
+        q_idx = cache["wt_q_idx"] | cache["act_q_idx"]
+
+        for i, p_name in enumerate(names):
+            g = grads.get(p_name)
+            if g is None:
                 continue
-            if (
-                param_group["weight_decay"] is not None
-                and param_group["variant"] == "adamw"
-            ):
-                if "d_quant" in p_name or "t_quant" in p_name or "q_m" in p_name:
-                    p.data.add_(
-                        param_group["weight_decay"] * p.data,
-                        alpha=-param_group["lr_quant"],
-                    )
-                else:
-                    p.data.add_(
-                        param_group["weight_decay"] * p.data, alpha=-param_group["lr"]
-                    )
+            p = params[i]
+            step_lr = lr_quant if i in q_idx else lr
+            if apply_wd:
+                p.data.add_(wd * p.data, alpha=-step_lr)
+            p.data.add_(g, alpha=-step_lr)
 
-            # Assign different learning rate to weights and quantization params
-            if "d_quant" in p_name or "t_quant" in p_name or "q_m" in p_name:
-                p.data.add_(
-                    param_group["grad_variant"][p_name], alpha=-param_group["lr_quant"]
-                )
-            else:
-                p.data.add_(
-                    param_group["grad_variant"][p_name], alpha=-param_group["lr"]
-                )
-
-        for layer_name in bit_dict.keys():
-            t_quant_wt = None
-            t_quant_act = None
-            for p_name, p in zip(param_group["p_names"], param_group["params"]):
-                if layer_name in p_name:
-                    if "t_quant_wt" in p_name:
-                        t_quant_wt = p.data
-                    if "q_m_wt" in p_name:
-                        q_m_wt = p.data
-                    if "t_quant_act" in p_name:
-                        t_quant_act = p.data
-                    if "q_m_act" in p_name:
-                        q_m_act = p.data
-            for p_name, p in zip(param_group["p_names"], param_group["params"]):
-                if layer_name in p_name and "d_quant_wt" in p_name:
-                    bit_width = bit_dict[layer_name]["weight"]
-                    d_quant_wt = self._d_quant_helper(bit_width, q_m_wt, t_quant_wt)
-                    # 性能: 原地 clamp, 避免每步给参数重新分配张量
-                    p.data.clamp_(min=d_quant_wt, max=d_quant_wt)
-                if layer_name in p_name and "d_quant_act" in p_name:
-                    bit_width = bit_dict[layer_name]["activation"]
-                    d_quant_act = self._d_quant_helper(bit_width, q_m_act, t_quant_act)
-                    p.data.clamp_(min=d_quant_act, max=d_quant_act)
+        # 位宽固定后把 d_quant 钳死到该位宽对应的值
+        for layer_name, bits in bit_dict.items():
+            idx = cache["layers"].get(layer_name)
+            if idx is None:
+                continue
+            if "d_wt" in idx and "qm_wt" in idx:
+                q_m_wt = params[idx["qm_wt"]].data
+                t_quant_wt = params[idx["t_wt"]].data if "t_wt" in idx else None
+                d = self._d_quant_helper(bits["weight"], q_m_wt, t_quant_wt)
+                params[idx["d_wt"]].data.clamp_(min=d, max=d)
+            if "d_act" in idx and "qm_act" in idx:
+                q_m_act = params[idx["qm_act"]].data
+                t_quant_act = params[idx["t_act"]].data if "t_act" in idx else None
+                d = self._d_quant_helper(bits["activation"], q_m_act, t_quant_act)
+                params[idx["d_act"]].data.clamp_(min=d, max=d)
 
     @staticmethod
     def _bit_width_helper(d_quant=None, q_m=None, t_quant=None):
