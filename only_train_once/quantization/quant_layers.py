@@ -128,19 +128,24 @@ class SymQuantizerNonLinear(torch.autograd.Function):
         # q_m <= q_s can happen
         # Clamp to avoid log(negative) -> NaN when input_abs < q_s
         d_safe = torch.clamp(d_quant, min=1e-8)
+        # 性能: 先取倒数, 把三处 div 换成 mul(div 在 GPU 上比 mul 慢 2~3 倍)
+        inv_d = 1.0 / d_safe
         rng = torch.abs(q_m - q_s) + 1e-6
         # 性能: pow(x, t) 比 exp(t*log(x)) 少两个全张量 kernel, 数值等价 (x > 0)
         range_pow = torch.pow(rng, t_quant)
-        input_diff = torch.clamp(input_abs - q_s, min=1e-8)  # avoid log(negative)
+        # 性能: 原地 clamp, 省一次全张量分配
+        input_diff = (input_abs - q_s).clamp_(min=1e-8)  # avoid log(negative)
         input_pow = torch.pow(input_diff, t_quant)
 
-        # 性能: 用 torch.where 替代布尔索引赋值(output[mask]=v 会触发分散写, 慢 ~24%)
-        sat_val = d_safe * torch.round(range_pow / d_safe)  # 标量: 饱和值
-        output = d_safe * torch.round(input_pow / d_safe)
+        # 性能: mul_/round_/mul_ 全原地, 相比 d_safe*round(x/d_safe) 少两次分配
+        sat_val = (range_pow * inv_d).round_().mul_(d_safe)  # 标量: 饱和值
+        output = input_pow.mul_(inv_d).round_().mul_(d_safe)
         # 性能: masked_fill 原地填 0, 省掉 zeros_like 的全张量分配
         output = output.masked_fill(input_abs <= q_s, 0.0)
         output = torch.where(input_abs >= q_m, sat_val.expand_as(output), output)
-        output = torch.sign(input) * output
+        # 性能: 用 sign 张量作容器原地乘, 比 torch.sign(input) * output 少一次分配。
+        # 注意: 不用 torch.copysign —— 它无法导出到 ONNX opset 16, 会阻断 deployment 链路。
+        output = torch.sign(input).mul_(output)
         # Guard against inf/nan from extreme quantization parameters.
         # 注意: 溢出时应饱和到 ±|q_m| (可表示上界), 而不是置 0 —— 置 0 会让
         # 整个量化层输出塌陷为 0, 模型在"看起来还在训练"的状态下悄悄死掉。
@@ -156,7 +161,7 @@ class SymQuantizerNonLinear(torch.autograd.Function):
         elif _check_tick() and not torch.isfinite(output).all():
             # 采样检查: 避免每层每步的全张量归约 + GPU 同步
             _nonfinite_report("forward")
-            sat = torch.abs(q_m).to(device).clamp(min=1e-8)
+            sat = torch.abs(q_m).to(output.device).clamp(min=1e-8)
             output = torch.where(
                 torch.isinf(output), torch.sign(output) * sat, output
             )
@@ -176,12 +181,15 @@ class SymQuantizerNonLinear(torch.autograd.Function):
 
         # Useful quantities — clamp to avoid log(negative) -> NaN and division by tiny d
         d_safe = torch.clamp(d_quant, min=1e-8)
+        # 性能: 取一次倒数, 后面三处 div 全换成 mul
+        inv_d = 1.0 / d_safe
         rng = torch.abs(q_m - q_s) + 1e-6  # q_m <= q_s can happen
         # 性能: pow 比 exp(t*log(x)) 少两个全张量 kernel, 数值等价 (x > 0)
         range_pow = torch.pow(rng, t_quant)
-        # 性能: rng^(t-1) = rng^t / rng, 省一次 pow
-        range_pow_low = range_pow / rng
-        input_diff = torch.clamp(input_abs - q_s, min=1e-8)  # avoid log(negative)
+        # 性能: rng^(t-1) = rng^t * (1/rng), 省一次 pow 且用 mul 代替 div
+        range_pow_low = range_pow * (1.0 / rng)
+        # 性能: 原地 clamp, 省一次全张量分配
+        input_diff = (input_abs - q_s).clamp_(min=1e-8)  # avoid log(negative)
         # 性能: pow 比 exp(t*log(x)) 少一个全张量 kernel, 数值等价 (x > 0)
         input_pow = torch.pow(input_diff, t_quant)
 
@@ -192,8 +200,8 @@ class SymQuantizerNonLinear(torch.autograd.Function):
         gs = grad_output * sign_in
 
         # ---- d_quant 梯度: round(x/d) - x/d ----
-        q = input_pow / d_safe
-        rq = range_pow / d_safe
+        q = input_pow * inv_d
+        rq = range_pow * inv_d
         grad_d_xq = torch.round(q) - q
         grad_d_xq = torch.where(
             mask_ge_qm,
