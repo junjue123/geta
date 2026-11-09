@@ -64,7 +64,7 @@ from datetime import datetime
 
 # ---- 强制 CPU、关掉 CUDA，保证轻量可复现 -------------------------------
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import torch

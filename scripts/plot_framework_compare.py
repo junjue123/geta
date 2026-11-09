@@ -50,13 +50,18 @@ CIFAR10_CLASSES = ["airplane", "automobile", "bird", "cat", "deer",
                    "dog", "frog", "horse", "ship", "truck"]
 COLORS = plt.cm.tab10(np.linspace(0, 1, 10))
 
-# Okabe-Ito 色盲安全配色 (期刊通用, 灰阶打印可辨)
-C_ORIGIN = "#D55E00"   # baseline: 朱红
-C_OURS = "#0072B2"     # DACO: 蓝
+# 深蓝/深红学术配色 (期刊通用, 灰阶打印可辨, 双轴图常用)
+C_ORIGIN = "#B22222"   # baseline: 深红
+C_OURS = "#1F4E79"     # DACF: 深蓝
 C_ORIGIN_L = C_ORIGIN
 C_OURS_L = C_OURS
+# 双轴图专用: 颜色编码指标(左轴accuracy=深蓝, 右轴compression=深红), 线型编码方法
+C_ACC = C_OURS         # accuracy (左轴) = 深蓝
+C_CR = C_ORIGIN        # compression (右轴) = 深红
+LS_BASE = "--"         # baseline 虚线
+LS_OURS = "-"          # DACF 实线
 LABEL_ORIGIN = "baseline"
-LABEL_OURS = "DACO"
+LABEL_OURS = "DACF"
 DPI = 200   # 出图用; 论文排版按 200 dpi 导出即可
 
 
@@ -245,7 +250,11 @@ def plot_tsne_center_drift(o_protos, u_protos, out_dir, warmup, perplexity=30):
 
 
 def plot_combined(o, u, o_protos, u_protos, out_dir, warmup, perplexity=30):
-    """总图: 左 = 准确率(左轴) + 压缩率(右轴); 右 = t-SNE 表示的特征漂移。"""
+    """总图: 左 = 准确率(实线) + 压缩率(半透明曲线) 双轴, 颜色编码方法;
+       右 = t-SNE 特征漂移干净曲线, inset 用颜色渐变表示时间演进。"""
+    from matplotlib.collections import LineCollection
+    from matplotlib.colors import LinearSegmentedColormap
+
     oc, uc, do, du = _tsne_center_drift(o_protos, u_protos, perplexity)
     ep_o = np.array(o["history"]["epoch"])
     ep_u = np.array(u["history"]["epoch"])
@@ -253,85 +262,84 @@ def plot_combined(o, u, o_protos, u_protos, out_dir, warmup, perplexity=30):
     d_ep_u = np.arange(2, len(du) + 2)
 
     fig, axes = plt.subplots(
-        1, 2, figsize=(12.4, 4.2),
+        1, 2, figsize=(12.4, 4.4),
         gridspec_kw={"width_ratios": [1.45, 1.0], "wspace": 0.34})
 
-    # ---------------- 左: 准确率 + 压缩率 ----------------
+    # ---------------- 左: 双轴, 颜色=方法, 透明度=指标 ----------------
     ax = axes[0]
     ax2 = ax.twinx()
-    ax.plot(ep_o, o["history"]["val_acc"], color=C_ORIGIN, linewidth=1.6)
-    ax.plot(ep_u, u["history"]["val_acc"], color=C_OURS, linewidth=1.6)
-    ax2.plot(ep_o, o["history"]["cr_bops"], color=C_ORIGIN, linewidth=1.1,
-             linestyle=(0, (4, 2.5)))
-    ax2.plot(ep_u, u["history"]["cr_bops"], color=C_OURS, linewidth=1.1,
-             linestyle=(0, (4, 2.5)))
+    # accuracy (左轴, 实线不透明)
+    ax.plot(ep_o, o["history"]["val_acc"], color=C_ORIGIN, linewidth=1.5,
+            alpha=0.95)
+    ax.plot(ep_u, u["history"]["val_acc"], color=C_OURS, linewidth=1.7,
+            alpha=0.95)
+    # compression (右轴, 半透明虚线)
+    ax2.plot(ep_o, o["history"]["cr_bops"], color=C_ORIGIN, linewidth=1.3,
+             alpha=0.40, linestyle="--")
+    ax2.plot(ep_u, u["history"]["cr_bops"], color=C_OURS, linewidth=1.3,
+             alpha=0.40, linestyle="--")
     if warmup > 0:
-        ax.axvline(warmup, color="#8a8a8a", linestyle=":", linewidth=0.8)
+        ax.axvline(warmup, color="#9a9a9a", linestyle=":", linewidth=0.8)
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Top-1 accuracy")
     ax2.set_ylabel("Compression rate (BOPs, ×)")
     ax.set_ylim(0.15, 0.70)
     ax2.set_ylim(8, 42)
-    ax.text(0.012, 0.985, "(a)", transform=ax.transAxes, fontsize=10,
-            fontweight="bold", va="top")
+    ax.set_title("(a) Accuracy and compression rate", fontsize=10,
+                 loc="left", pad=6)
+    ax.legend(loc="lower right", fontsize=8, frameon=False, handles=[
+        Line2D([0], [0], color=C_ORIGIN, lw=1.5, label="baseline"),
+        Line2D([0], [0], color=C_OURS, lw=1.7, label=LABEL_OURS),
+        Line2D([0], [0], color="#6e6e6e", lw=1.3, alpha=0.55, ls="--",
+               label="dashed: compression (right)"),
+    ])
 
-    # ---------------- 右: t-SNE 特征漂移 ----------------
+    # ---------------- 右: 干净漂移曲线 ----------------
     ax = axes[1]
-    ax.plot(d_ep_o, do, color=C_ORIGIN, linewidth=1.2)
-    ax.plot(d_ep_u, du, color=C_OURS, linewidth=1.2)
+    ax.plot(d_ep_o, do, color=C_ORIGIN, linewidth=1.4, label=LABEL_ORIGIN)
+    ax.plot(d_ep_u, du, color=C_OURS, linewidth=1.4, label=LABEL_OURS)
     if warmup > 0:
-        ax.axvline(warmup, color="#8a8a8a", linestyle=":", linewidth=0.8)
+        ax.axvline(warmup, color="#9a9a9a", linestyle=":", linewidth=0.8)
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Drift of epoch-mean (t-SNE)")
-    ax.set_ylim(-4, do.max() * 1.32)
-    ax.text(0.012, 0.985, "(b)", transform=ax.transAxes, fontsize=10,
-            fontweight="bold", va="top")
-    for tag, d in ((LABEL_ORIGIN, do), (LABEL_OURS, du)):
-        i = int(d.argmax())
-        ax.annotate(f"{d.max():.1f} @ep{i + 2}", xy=(i + 2, d.max()),
-                    xytext=(i + 2, d.max() + d.max() * 0.06), fontsize=6.8,
-                    color="#4a4a4a", ha="center")
+    ax.set_ylim(-2, max(do.max(), du.max()) * 1.30)
+    ax.set_title("(b) Feature drift", fontsize=10, loc="left", pad=6)
+    ax.legend(loc="upper right", fontsize=8, frameon=False)
 
-    # 左上角内嵌: epoch 代表点在 t-SNE 平面上的路径
-    # 抽稀到 ~14 个点并让标记沿时间变大, 否则 100 个点挤在这么小的框里看不清走向
-    axi = ax.inset_axes([0.045, 0.52, 0.40, 0.42])
-    for c, col in ((oc, C_ORIGIN), (uc, C_OURS)):
-        step = max(1, len(c) // 14)
-        idx = list(range(0, len(c), step))
-        if idx[-1] != len(c) - 1:
-            idx.append(len(c) - 1)
-        p = c[idx]
-        axi.plot(p[:, 0], p[:, 1], color=col, linewidth=1.0, alpha=0.9)
-        sizes = np.linspace(5, 30, len(p))
-        axi.scatter(p[:, 0], p[:, 1], s=sizes, color=col, edgecolors="white",
-                    linewidths=0.5, zorder=3)
-        axi.scatter(p[0, 0], p[0, 1], s=26, facecolors="none", edgecolors=col,
-                    linewidths=1.0, zorder=4)
+    # ----- inset: 颜色渐变 = 时间演进 (浅=早期, 深=后期) -----
+    axi = ax.inset_axes([0.06, 0.52, 0.34, 0.33])
+    cmap_red = LinearSegmentedColormap.from_list(
+        "red_grad", ["#F5C6C2", "#B22222"])
+    cmap_blue = LinearSegmentedColormap.from_list(
+        "blue_grad", ["#AFC8DC", "#1F4E79"])
+    for cc, cmap in ((oc, cmap_red), (uc, cmap_blue)):
+        segs = np.stack([cc[:-1], cc[1:]], axis=1)
+        cols = cmap(np.linspace(0, 1, len(segs)))
+        axi.add_collection(LineCollection(
+            segs, colors=cols, linewidths=1.6, alpha=0.95,
+            capstyle="round", zorder=2))
+    all_pts = np.concatenate([oc, uc], axis=0)
+    x0, x1 = all_pts[:, 0].min(), all_pts[:, 0].max()
+    y0, y1 = all_pts[:, 1].min(), all_pts[:, 1].max()
+    px = (x1 - x0) * 0.08 + 1e-6
+    py = (y1 - y0) * 0.08 + 1e-6
+    axi.set_xlim(x0 - px, x1 + px)
+    axi.set_ylim(y0 - py, y1 + py)
     axi.set_xticks([])
     axi.set_yticks([])
     axi.tick_params(length=0)
     for sp in axi.spines.values():
         sp.set_linewidth(0.6)
         sp.set_color("#9a9a9a")
-    axi.set_title("prototype drift path", fontsize=6.5, pad=2.5, color="#4a4a4a")
-
-    # 图底统一图例: 颜色=方法, 线型=指标
-    from matplotlib.lines import Line2D
-    handles = [
-        Line2D([0], [0], color=C_ORIGIN, lw=1.6, label=LABEL_ORIGIN),
-        Line2D([0], [0], color=C_OURS, lw=1.6, label=LABEL_OURS),
-        Line2D([0], [0], color="#4a4a4a", lw=1.1, ls=(0, (4, 2.5)),
-               label="dashed: compression (right axis)"),
-        Line2D([0], [0], color="#4a4a4a", lw=0.8, ls=":", label="warmup end"),
-    ]
-    fig.legend(handles=handles, loc="lower center", ncol=4, fontsize=8,
-               frameon=False, bbox_to_anchor=(0.5, -0.045),
-               handlelength=2.0, columnspacing=1.6)
+    axi.set_title("drift path (light → dark)", fontsize=6,
+                  pad=2.5, color="#4a4a4a")
 
     plt.savefig(os.path.join(out_dir, "fig_combined.png"),
                 dpi=DPI, bbox_inches="tight")
+    plt.savefig(os.path.join(out_dir, "fig_combined.pdf"),
+                bbox_inches="tight")  # 论文投稿用矢量图
     plt.close()
-    print(f"[FIG] {os.path.join(out_dir, 'fig_combined.png')}")
+    print(f"[FIG] {os.path.join(out_dir, 'fig_combined.png')} (+ .pdf)")
     return do, du
 
 

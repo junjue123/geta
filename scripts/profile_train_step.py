@@ -26,9 +26,9 @@ torch.manual_seed(0)
 DEV = "cuda"
 torch.backends.cudnn.benchmark = True
 
-# ---- 数据 (与 run_daco_vs_baseline 的 fast 管道一致) ----
+# ---- 数据 (与 train 的 fast 管道一致) ----
 sys.path.insert(0, SCRIPT)
-from run_daco_vs_baseline import _FastCIFARLocal
+from train import _FastCIFARLocal
 ds = _FastCIFARLocal(os.path.join(SCRIPT, "datasets/cifar10"), train=True, augment=True)
 loader = DataLoader(ds, batch_size=args.bs, shuffle=True, num_workers=0,
                     pin_memory=False, drop_last=True)

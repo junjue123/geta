@@ -25,7 +25,7 @@ p.add_argument("--mode", default="WA", choices=["WA", "W"], help="WA=权重+激�
 p.add_argument("--data", default="E:/pythonProject/geta-main/geta-main_origin/datasets/cifar10")
 args = p.parse_args()
 
-ROOT = os.path.abspath(args.root or os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.abspath(args.root or os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT)
 os.chdir(ROOT)
 print(f"[ENV] framework root = {ROOT}")

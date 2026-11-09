@@ -45,6 +45,9 @@ datasets/
 *.log
 logs/
 
+# 运行期产物 (量化打分日志 / 中间图)
+temp/
+
 # OS
 .DS_Store
 Thumbs.db

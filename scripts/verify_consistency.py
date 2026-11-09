@@ -19,7 +19,7 @@ from only_train_once import OTO
 from only_train_once.quantization.quant_model import model_to_quantize_model
 from only_train_once.quantization.quant_layers import QuantizationMode
 from sanity_check.backends.resnet20_cifar10 import resnet20_cifar10
-from run_daco_vs_baseline import _FastCIFARLocal
+from train import _FastCIFARLocal
 
 DEV = "cuda"
 
