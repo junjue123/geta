@@ -4,8 +4,8 @@
 跨框架对比可视化: 原始 GETA vs 我们的框架(DACO)
 ================================================
 读取两个独立实验目录的输出:
-  origin_dir/  <- run_daco_vs_baseline.py --root <microsoft/geta> --modes baseline
-  ours_dir/    <- run_daco_vs_baseline.py --modes daco
+  origin_dir/  <- train.py --root <microsoft/geta> --modes baseline
+  ours_dir/    <- train.py --modes daco
 
 生成:
   1. fig_curves.png          (a) Top-1 准确率  (b) 稀疏度/剪枝率  (c) 整体压缩率
@@ -50,10 +50,14 @@ CIFAR10_CLASSES = ["airplane", "automobile", "bird", "cat", "deer",
                    "dog", "frog", "horse", "ship", "truck"]
 COLORS = plt.cm.tab10(np.linspace(0, 1, 10))
 
-C_ORIGIN = "#9e9e9e"
-C_OURS = "#1976d2"
-LABEL_ORIGIN = "Original GETA"
-LABEL_OURS = "Ours (DACO)"
+# Okabe-Ito 色盲安全配色 (期刊通用, 灰阶打印可辨)
+C_ORIGIN = "#D55E00"   # baseline: 朱红
+C_OURS = "#0072B2"     # DACO: 蓝
+C_ORIGIN_L = C_ORIGIN
+C_OURS_L = C_OURS
+LABEL_ORIGIN = "baseline"
+LABEL_OURS = "DACO"
+DPI = 200   # 出图用; 论文排版按 200 dpi 导出即可
 
 
 def _load_json(path):
@@ -80,15 +84,21 @@ def load_protos(d, mode, model):
 # 1. 准确率 / 稀疏度 / 压缩率
 # ===========================================================================
 def plot_curves(o, u, out_dir):
-    fig, axes = plt.subplots(1, 3, figsize=(11.5, 3.2))
+    fig, axes = plt.subplots(1, 4, figsize=(15.0, 3.2))
     warmup = o.get("warmup_epochs", 15)
+
+    # 压缩率: 优先用论文 BOPs 口径 cr_bops = 32*32/((1-s)*w*a);
+    # 老的 overall_compress 是 (1-s)*16/w, 基准写成 16 且漏掉激活位宽, 不可用。
+    has_cr = ("cr_bops" in o["history"]) and ("cr_bops" in u["history"])
+    c_key = "cr_bops" if has_cr else "overall_compress"
+    c_label = "Compression Rate (BOPs, x)" if has_cr else "Overall Compression (x)"
 
     specs = [
         ("val_acc", "Top-1 Accuracy", "(a)"),
         ("prune_ratio", "Sparsity (pruned ratio)", "(b)"),
-        ("overall_compress", "Overall Compression (x)", "(c)"),
+        (c_key, c_label, "(c)"),
     ]
-    for ax, (key, ylabel, tag) in zip(axes, specs):
+    for ax, (key, ylabel, tag) in zip(axes[:3], specs):
         ep_o = np.array(o["history"]["epoch"])
         ep_u = np.array(u["history"]["epoch"])
         ax.plot(ep_o, o["history"][key], color=C_ORIGIN, linewidth=1.2,
@@ -104,15 +114,36 @@ def plot_curves(o, u, out_dir):
         ax.text(0.02, 0.95, tag, transform=ax.transAxes, fontsize=10,
                 fontweight="bold", va="top")
 
+    # (d) 位宽双线: 权重实线 / 激活虚线, baseline 与 DACO 各一组
+    ax = axes[3]
+    ep_o = np.array(o["history"]["epoch"])
+    ep_u = np.array(u["history"]["epoch"])
+    ax.plot(ep_o, o["history"]["avg_weight_bit"], color=C_ORIGIN, linewidth=1.2,
+            linestyle="-", label=f"{LABEL_ORIGIN} W", alpha=0.95)
+    ax.plot(ep_o, o["history"]["avg_act_bit"], color=C_ORIGIN, linewidth=1.2,
+            linestyle="--", label=f"{LABEL_ORIGIN} A", alpha=0.95)
+    ax.plot(ep_u, u["history"]["avg_weight_bit"], color=C_OURS, linewidth=1.2,
+            linestyle="-", label=f"{LABEL_OURS} W", alpha=0.95)
+    ax.plot(ep_u, u["history"]["avg_act_bit"], color=C_OURS, linewidth=1.2,
+            linestyle="--", label=f"{LABEL_OURS} A", alpha=0.95)
+    if warmup > 0:
+        ax.axvline(warmup, color="gray", linestyle="--", linewidth=0.6, alpha=0.6)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Average bit-width")
+    ax.legend(loc="best", fontsize=7, ncol=2)
+    ax.text(0.02, 0.95, "(d)", transform=ax.transAxes, fontsize=10,
+            fontweight="bold", va="top")
+
     plt.tight_layout()
     path = os.path.join(out_dir, "fig_curves.png")
-    plt.savefig(path)
+    plt.savefig(path, dpi=DPI, bbox_inches="tight")
     plt.close()
     print(f"[FIG] {path}")
 
 
 # ===========================================================================
-# 2. t-SNE 类别原型迁移轨迹
+# 2. 特征空间漂移: 联合 t-SNE 出坐标, 每个 epoch 取「该 epoch 全部类坐标的
+#    均值」作为这一 epoch 在特征空间中的代表点, 代表点的逐 epoch 位移即漂移。
 # ===========================================================================
 def _align_dim(a, b):
     D = min(a.shape[2], b.shape[2])
@@ -128,13 +159,14 @@ def _align_dim(a, b):
     return out[0], out[1]
 
 
-def plot_tsne_trajectories(o_protos, u_protos, out_dir, warmup,
-                           perplexity=30):
-    To, Tu = o_protos.shape[0], u_protos.shape[0]
+def _tsne_center_drift(o_protos, u_protos, perplexity=30):
+    """返回 (oc, uc, do, du): 两边的 epoch 代表点轨迹与逐 epoch 位移。"""
     o_protos, u_protos = _align_dim(o_protos, u_protos)
+    To, C = o_protos.shape[0], o_protos.shape[1]
+    Tu = u_protos.shape[0]
 
-    o_flat = o_protos.reshape(To * 10, -1)
-    u_flat = u_protos.reshape(Tu * 10, -1)
+    o_flat = o_protos.reshape(To * C, -1)
+    u_flat = u_protos.reshape(Tu * C, -1)
     all_flat = np.concatenate([o_flat, u_flat], axis=0)
     if all_flat.shape[1] > 50:
         all_flat = PCA(n_components=50, random_state=42).fit_transform(all_flat)
@@ -143,81 +175,164 @@ def plot_tsne_trajectories(o_protos, u_protos, out_dir, warmup,
     print(f"  [t-SNE] {all_flat.shape[0]} 点, perplexity={perp} ...")
     emb = TSNE(n_components=2, perplexity=perp, random_state=42,
                init="pca", learning_rate="auto", n_iter=1500).fit_transform(all_flat)
-    o2d = emb[:To * 10].reshape(To, 10, 2)
-    u2d = emb[To * 10:].reshape(Tu, 10, 2)
+    o2d = emb[:To * C].reshape(To, C, 2)
+    u2d = emb[To * C:].reshape(Tu, C, 2)
 
-    fig, axes = plt.subplots(1, 2, figsize=(9.2, 4.4))
-    for ax, p2d, T, title in [
-        (axes[0], o2d, To, f"{LABEL_ORIGIN} (hard projection)"),
-        (axes[1], u2d, Tu, f"{LABEL_OURS} (RCAJS+MCSS+DGD)"),
-    ]:
-        for c in range(10):
-            traj = p2d[:, c, :]
-            ax.plot(traj[:, 0], traj[:, 1], color=COLORS[c], linewidth=0.9,
-                    alpha=0.7, zorder=1)
-            s = max(warmup, 0)
-            if s < T:
-                ax.scatter(traj[s, 0], traj[s, 1], color=COLORS[c], s=30,
-                           marker="o", edgecolors="black", linewidths=0.4,
-                           zorder=3)
-            ax.scatter(traj[-1, 0], traj[-1, 1], color=COLORS[c], s=35,
-                       marker="^", edgecolors="black", linewidths=0.4,
-                       zorder=3)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.set_xlabel(title, fontsize=10)
-        for sp in ax.spines.values():
-            sp.set_linewidth(0.6)
-
-    handles = [Line2D([0], [0], color=COLORS[c], lw=1.5, marker="o",
-                      markersize=5, markeredgecolor="black",
-                      markeredgewidth=0.3, label=CIFAR10_CLASSES[c])
-               for c in range(10)]
-    fig.legend(handles=handles, loc="lower center", ncol=5, fontsize=8,
-               frameon=False, bbox_to_anchor=(0.5, -0.04))
-    plt.tight_layout(rect=[0, 0.06, 1, 1])
-    path = os.path.join(out_dir, "fig_tsne_trajectories.png")
-    plt.savefig(path)
-    plt.close()
-    print(f"[FIG] {path}")
-    return o2d, u2d
+    # 每个 epoch 取该 epoch 全部类坐标的均值 -> (T, 2) 代表点
+    oc = o2d.mean(axis=1)
+    uc = u2d.mean(axis=1)
+    do = np.linalg.norm(np.diff(oc, axis=0), axis=1)
+    du = np.linalg.norm(np.diff(uc, axis=0), axis=1)
+    return oc, uc, do, du
 
 
-# ===========================================================================
-# 3. 特征漂移幅度: 每个 epoch 内类别原型的平均位移
-#    轨迹越"抖", 曲线越高; DACO 期望更平滑
-# ===========================================================================
-def plot_drift(o2d, u2d, out_dir, warmup):
-    def step_disp(a):
-        # (T,10,2) -> (T-1,) 相邻 epoch 的类别原型平均欧氏位移
-        d = np.linalg.norm(np.diff(a, axis=0), axis=2)  # (T-1,10)
-        return d.mean(axis=1)
+def plot_tsne_center_drift(o_protos, u_protos, out_dir, warmup, perplexity=30):
+    oc, uc, do, du = _tsne_center_drift(o_protos, u_protos, perplexity)
 
-    do, du = step_disp(o2d), step_disp(u2d)
-    ep = np.arange(2, len(do) + 2)
+    ep_o = np.arange(2, len(do) + 2)
+    ep_u = np.arange(2, len(du) + 2)
 
-    fig, ax = plt.subplots(figsize=(6.4, 3.4))
-    ax.plot(ep, do, color=C_ORIGIN, linewidth=1.1, label=LABEL_ORIGIN, alpha=0.95)
-    ax.plot(ep, du, color=C_OURS, linewidth=1.1, label=LABEL_OURS, alpha=0.95)
+    fig, axes = plt.subplots(1, 2, figsize=(10.6, 3.8))
+
+    # (a) 代表点在 t-SNE 平面上的移动轨迹
+    ax = axes[0]
+    ax.plot(oc[:, 0], oc[:, 1], color=C_ORIGIN, linewidth=1.1,
+            label=LABEL_ORIGIN, alpha=0.9)
+    ax.plot(uc[:, 0], uc[:, 1], color=C_OURS, linewidth=1.1,
+            label=LABEL_OURS, alpha=0.9)
+    for cc, col in ((oc, C_ORIGIN), (uc, C_OURS)):
+        ax.scatter(cc[0, 0], cc[0, 1], color=col, s=34, marker="o",
+                   edgecolors="black", linewidths=0.4, zorder=3)
+        ax.scatter(cc[-1, 0], cc[-1, 1], color=col, s=38, marker="^",
+                   edgecolors="black", linewidths=0.4, zorder=3)
+    ax.set_xlabel("t-SNE dim 1")
+    ax.set_ylabel("t-SNE dim 2")
+    ax.legend(loc="best", fontsize=8)
+    ax.text(0.02, 0.95, "(a)", transform=ax.transAxes, fontsize=10,
+            fontweight="bold", va="top")
+
+    # (b) 代表点的逐 epoch 位移
+    ax = axes[1]
+    ax.plot(ep_o, do, color=C_ORIGIN, linewidth=1.1, label=LABEL_ORIGIN, alpha=0.95)
+    ax.plot(ep_u, du, color=C_OURS, linewidth=1.1, label=LABEL_OURS, alpha=0.95)
     if warmup > 0:
         ax.axvline(warmup, color="gray", linestyle="--", linewidth=0.6, alpha=0.6)
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("Prototype displacement (t-SNE space)")
-    ax.legend(loc="best", fontsize=8)
+    ax.set_ylabel("Displacement of epoch mean (t-SNE)")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.text(0.02, 0.95, "(b)", transform=ax.transAxes, fontsize=10,
+            fontweight="bold", va="top")
 
-    # 联合阶段(log10 尺度)的平均漂移, 直接量化"平滑度"
-    j = warmup
-    if j < len(do):
-        mo, mu = do[j:].mean(), du[j:].mean()
-        ax.text(0.98, 0.95,
-                f"joint-phase mean: {LABEL_ORIGIN}={mo:.3f}, {LABEL_OURS}={mu:.3f}",
-                transform=ax.transAxes, fontsize=7, ha="right", va="top",
-                color="#424242")
+    j_o = warmup if warmup < len(do) else 0
+    j_u = warmup if warmup < len(du) else 0
+    ax.text(0.98, 0.80,
+            f"joint mean: {LABEL_ORIGIN}={do[j_o:].mean():.3f}, "
+            f"{LABEL_OURS}={du[j_u:].mean():.3f}",
+            transform=ax.transAxes, fontsize=7, ha="right", va="top",
+            color="#424242")
+
     plt.tight_layout()
-    path = os.path.join(out_dir, "fig_drift_metric.png")
-    plt.savefig(path)
+    path = os.path.join(out_dir, "fig_feature_drift.png")
+    plt.savefig(path, dpi=DPI, bbox_inches="tight")
     plt.close()
     print(f"[FIG] {path}")
+
+    print(f"  [DRIFT] {LABEL_ORIGIN}: mean={do.mean():.3f} max={do.max():.3f} "
+          f"@ep{ep_o[int(do.argmax())]} | total path={np.linalg.norm(np.diff(oc, axis=0), axis=1).sum():.2f}")
+    print(f"  [DRIFT] {LABEL_OURS}: mean={du.mean():.3f} max={du.max():.3f} "
+          f"@ep{ep_u[int(du.argmax())]} | total path={np.linalg.norm(np.diff(uc, axis=0), axis=1).sum():.2f}")
+    return do, du
+
+
+def plot_combined(o, u, o_protos, u_protos, out_dir, warmup, perplexity=30):
+    """总图: 左 = 准确率(左轴) + 压缩率(右轴); 右 = t-SNE 表示的特征漂移。"""
+    oc, uc, do, du = _tsne_center_drift(o_protos, u_protos, perplexity)
+    ep_o = np.array(o["history"]["epoch"])
+    ep_u = np.array(u["history"]["epoch"])
+    d_ep_o = np.arange(2, len(do) + 2)
+    d_ep_u = np.arange(2, len(du) + 2)
+
+    fig, axes = plt.subplots(
+        1, 2, figsize=(12.4, 4.2),
+        gridspec_kw={"width_ratios": [1.45, 1.0], "wspace": 0.34})
+
+    # ---------------- 左: 准确率 + 压缩率 ----------------
+    ax = axes[0]
+    ax2 = ax.twinx()
+    ax.plot(ep_o, o["history"]["val_acc"], color=C_ORIGIN, linewidth=1.6)
+    ax.plot(ep_u, u["history"]["val_acc"], color=C_OURS, linewidth=1.6)
+    ax2.plot(ep_o, o["history"]["cr_bops"], color=C_ORIGIN, linewidth=1.1,
+             linestyle=(0, (4, 2.5)))
+    ax2.plot(ep_u, u["history"]["cr_bops"], color=C_OURS, linewidth=1.1,
+             linestyle=(0, (4, 2.5)))
+    if warmup > 0:
+        ax.axvline(warmup, color="#8a8a8a", linestyle=":", linewidth=0.8)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Top-1 accuracy")
+    ax2.set_ylabel("Compression rate (BOPs, ×)")
+    ax.set_ylim(0.15, 0.70)
+    ax2.set_ylim(8, 42)
+    ax.text(0.012, 0.985, "(a)", transform=ax.transAxes, fontsize=10,
+            fontweight="bold", va="top")
+
+    # ---------------- 右: t-SNE 特征漂移 ----------------
+    ax = axes[1]
+    ax.plot(d_ep_o, do, color=C_ORIGIN, linewidth=1.2)
+    ax.plot(d_ep_u, du, color=C_OURS, linewidth=1.2)
+    if warmup > 0:
+        ax.axvline(warmup, color="#8a8a8a", linestyle=":", linewidth=0.8)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Drift of epoch-mean (t-SNE)")
+    ax.set_ylim(-4, do.max() * 1.32)
+    ax.text(0.012, 0.985, "(b)", transform=ax.transAxes, fontsize=10,
+            fontweight="bold", va="top")
+    for tag, d in ((LABEL_ORIGIN, do), (LABEL_OURS, du)):
+        i = int(d.argmax())
+        ax.annotate(f"{d.max():.1f} @ep{i + 2}", xy=(i + 2, d.max()),
+                    xytext=(i + 2, d.max() + d.max() * 0.06), fontsize=6.8,
+                    color="#4a4a4a", ha="center")
+
+    # 左上角内嵌: epoch 代表点在 t-SNE 平面上的路径
+    # 抽稀到 ~14 个点并让标记沿时间变大, 否则 100 个点挤在这么小的框里看不清走向
+    axi = ax.inset_axes([0.045, 0.52, 0.40, 0.42])
+    for c, col in ((oc, C_ORIGIN), (uc, C_OURS)):
+        step = max(1, len(c) // 14)
+        idx = list(range(0, len(c), step))
+        if idx[-1] != len(c) - 1:
+            idx.append(len(c) - 1)
+        p = c[idx]
+        axi.plot(p[:, 0], p[:, 1], color=col, linewidth=1.0, alpha=0.9)
+        sizes = np.linspace(5, 30, len(p))
+        axi.scatter(p[:, 0], p[:, 1], s=sizes, color=col, edgecolors="white",
+                    linewidths=0.5, zorder=3)
+        axi.scatter(p[0, 0], p[0, 1], s=26, facecolors="none", edgecolors=col,
+                    linewidths=1.0, zorder=4)
+    axi.set_xticks([])
+    axi.set_yticks([])
+    axi.tick_params(length=0)
+    for sp in axi.spines.values():
+        sp.set_linewidth(0.6)
+        sp.set_color("#9a9a9a")
+    axi.set_title("prototype drift path", fontsize=6.5, pad=2.5, color="#4a4a4a")
+
+    # 图底统一图例: 颜色=方法, 线型=指标
+    from matplotlib.lines import Line2D
+    handles = [
+        Line2D([0], [0], color=C_ORIGIN, lw=1.6, label=LABEL_ORIGIN),
+        Line2D([0], [0], color=C_OURS, lw=1.6, label=LABEL_OURS),
+        Line2D([0], [0], color="#4a4a4a", lw=1.1, ls=(0, (4, 2.5)),
+               label="dashed: compression (right axis)"),
+        Line2D([0], [0], color="#4a4a4a", lw=0.8, ls=":", label="warmup end"),
+    ]
+    fig.legend(handles=handles, loc="lower center", ncol=4, fontsize=8,
+               frameon=False, bbox_to_anchor=(0.5, -0.045),
+               handlelength=2.0, columnspacing=1.6)
+
+    plt.savefig(os.path.join(out_dir, "fig_combined.png"),
+                dpi=DPI, bbox_inches="tight")
+    plt.close()
+    print(f"[FIG] {os.path.join(out_dir, 'fig_combined.png')}")
+    return do, du
 
 
 def main():
@@ -251,11 +366,9 @@ def main():
         op = load_protos(args.origin_dir, args.mode_origin, model)
         up = load_protos(args.ours_dir, args.mode_ours, model)
         print(f"  [PROTO] origin {op.shape}, ours {up.shape}")
-        o2d, u2d = plot_tsne_trajectories(op, up, args.out, warmup,
-                                          args.tsne_perplexity)
-        plot_drift(o2d, u2d, args.out, warmup)
+        plot_combined(o, u, op, up, args.out, warmup, args.tsne_perplexity)
     except FileNotFoundError as e:
-        print(f"[WARN] 原型缺失, 跳过 t-SNE: {e}")
+        print(f"[WARN] 原型缺失, 跳过特征漂移图: {e}")
 
     print(f"\n输出目录: {args.out}")
 

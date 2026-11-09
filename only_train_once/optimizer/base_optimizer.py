@@ -56,21 +56,27 @@ class BaseOptimizer(Optimizer):
                 if not is_adam:
                     if group["first_momentum"] > 0.0 or group["dampening"] > 0.0:
                         refined_grad_f = self.get_first_momentum_grad(
-                            f"grad_first_moment_buffer_group_{i}_param_{j}",
+                            p_name,
                             group["first_momentum"],
                             group["dampening"],
                             refined_grad_f,
                         )
                     group["grad_variant"][p_name] = refined_grad_f
                 else:
+                    # 动量 buffer 用参数名而不是 (group_idx, param_idx) 作 key。
+                    # GETA 剪枝会重排/重建 param_groups, 用索引作 key 时,
+                    # 跨进程断点续训会把某个参数的 buffer 套到另一个参数上
+                    # (典型报错: "output with shape [1] doesn't match the
+                    # broadcast shape [32, 32, 3, 3]")。参数名在模型内唯一且
+                    # 与剪枝无关, 因此可安全跨运行恢复。
                     first_moment_grad = self.get_first_momentum_grad(
-                        f"grad_first_moment_buffer_group_{i}_param_{j}",
+                        p_name,
                         group["first_momentum"],
                         group["first_momentum"],
                         refined_grad_f,
                     )
                     second_moment_grad_sq = self.get_second_momentum_grad_square(
-                        f"grad_second_moment_buffer_group_{i}_param_{j}",
+                        p_name,
                         group["second_momentum"],
                         group["second_momentum"],
                         refined_grad_f,

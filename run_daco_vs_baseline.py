@@ -552,6 +552,77 @@ def _flush_epoch_artifacts(args, mode, history, prototypes_seq):
         print(f"  [WARN] 增量落盘失败: {e}", flush=True)
 
 
+def _save_ckpt(path, model, opt, scheduler, epoch, history, prototypes_seq,
+               total_epochs=None):
+    """保存可续训的完整状态。
+
+    注意 GETA 的一阶/二阶动量缓冲是优化器的自定义属性(first_moment_grads /
+    second_moment_grads), 不在 torch.optim 的标准 state 里, 必须单独存,
+    否则续训后 Adam 的 v 需要重新估计, 会造成 loss 突跳。
+    history 与 prototypes 一并保存, 保证续训后 t-SNE 轨迹不断档。
+    """
+    torch.save({
+        "epoch": epoch,                      # 已完成的 epoch 数(1-based)
+        "total_epochs": total_epochs,
+        "model": model.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "opt_moments": {
+            "first": getattr(opt, "first_moment_grads", {}),
+            "second": getattr(opt, "second_moment_grads", {}),
+        },
+        "num_steps": getattr(opt, "num_steps", 0),
+        "history": history,
+        "prototypes": list(prototypes_seq),
+    }, path)
+
+
+def _resume_from(path, model, opt, scheduler, history, prototypes_seq, device,
+                 total_epochs=None):
+    """从 ckpt 恢复现场, 返回已完成的 epoch 数。"""
+    try:
+        ck = torch.load(path, map_location=device, weights_only=False)
+    except TypeError:  # 老版本 torch 无 weights_only 参数
+        ck = torch.load(path, map_location=device)
+
+    saved_total = ck.get("total_epochs")
+    if (saved_total is not None and total_epochs is not None
+            and saved_total != total_epochs):
+        print(f"  [RESUME][WARN] ckpt total_epochs={saved_total} 与本次 "
+              f"{total_epochs} 不一致, 余弦退火曲线的 T_max 变化会导致学习率"
+              f"不连续; 续训请使用完全相同的 --warmup-epochs/--epochs",
+              flush=True)
+
+    model.load_state_dict(ck["model"])
+
+    mom = ck.get("opt_moments") or {}
+    # 只恢复参数名能对上的动量 buffer。旧版 ckpt 用的是 (group_idx, param_idx)
+    # 索引 key, 剪枝重排 param_groups 后必然错位, 直接丢弃比套错更安全。
+    valid_names = {n for g in opt.param_groups for n in g["p_names"]}
+    for attr, key in (("first_moment_grads", "first"),
+                      ("second_moment_grads", "second")):
+        saved = mom.get(key) or {}
+        restored = {k: v for k, v in saved.items() if k in valid_names}
+        setattr(opt, attr, restored)
+        dropped = len(saved) - len(restored)
+        if dropped:
+            print(f"  [RESUME] {attr}: 丢弃 {dropped} 个无法匹配的旧 buffer "
+                  f"(动量将从 0 重新估计)", flush=True)
+    opt.num_steps = ck.get("num_steps", opt.num_steps)
+
+    try:
+        scheduler.load_state_dict(ck["scheduler"])
+    except Exception as e:
+        print(f"  [RESUME][WARN] scheduler 恢复失败({e}), 从当前 step 重新计时")
+
+    saved_hist = ck.get("history", {})
+    for k in history:
+        history[k] = list(saved_hist.get(k, []))
+    prototypes_seq.clear()
+    prototypes_seq.extend([np.asarray(p) for p in ck.get("prototypes", [])])
+
+    return int(ck.get("epoch", 0))
+
+
 def run_experiment(args, mode):
     set_seed(args.seed, args.deterministic)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -578,8 +649,15 @@ def run_experiment(args, mode):
     total = warmup + joint
     configure_training_schedule(opt, warmup, joint, steps_per_epoch)
 
+    # 余弦退火: eta_min 必须显著小于起始 lr, 否则退火失效。
+    # 原先写死 1e-3, 在 sgd/lr=0.1 时是 0.1->0.001 的正常衰减; 但改成
+    # adam/lr=1e-3 后起点与终点都是 1e-3, 等于全程恒定学习率,
+    # 会显著压低最终精度并放大剪枝阶段的准确率震荡。
+    eta_min = args.lr * 0.01
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=total * steps_per_epoch, eta_min=1e-3)
+        opt, T_max=total * steps_per_epoch, eta_min=eta_min)
+    print(f"  [SCHED] CosineAnnealingLR lr {args.lr:g} -> {eta_min:g} "
+          f"over {total * steps_per_epoch} steps")
     criterion = nn.CrossEntropyLoss()
 
     # 每 epoch 记录: 指标 + 类别原型
@@ -591,9 +669,23 @@ def run_experiment(args, mode):
 
     cfg = BASELINE_OVERRIDE if mode == "baseline" else PAPER_DEFAULTS
     feat_target = "avg_pool" if args.model == "resnet20" else "classifier"
+
+    # ---- 断点续训 ----
+    ckpt_dir = os.path.join(args.out, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    latest_ckpt = os.path.join(ckpt_dir, f"{args.model}_{mode}_latest.pt")
+    start_ep = 0
+    if getattr(args, "resume", False) and os.path.exists(latest_ckpt):
+        start_ep = _resume_from(latest_ckpt, model, opt, scheduler,
+                                history, prototypes_seq, device, total)
+        print(f"  [RESUME] 从 {latest_ckpt} 恢复, 已完成 {start_ep} epoch, "
+              f"num_steps={opt.num_steps}", flush=True)
+    elif getattr(args, "resume", False):
+        print(f"  [RESUME] 未找到 {latest_ckpt}, 从头开始", flush=True)
+
     t0 = time.time()
 
-    for ep in range(total):
+    for ep in range(start_ep, total):
         phase = "warmup" if ep < warmup else "joint"
         print(f"\n  Epoch {ep+1}/{total} [{phase}]", flush=True)
         tr_loss, tr_acc = train_one_epoch(
@@ -630,6 +722,14 @@ def run_experiment(args, mode):
         # 几小时的原型数据全部丢失, 改图只能重跑。改为逐 epoch 覆盖写后,
         # 任何时刻磁盘上都有"到目前为止"的完整可画图数据。
         _flush_epoch_artifacts(args, mode, history, prototypes_seq)
+
+        # 断点续训: latest 每 epoch 覆盖(单份约 3.5MB), 另每 ckpt_every 存快照。
+        # 放在 flush 之后, 保证 ckpt 与已落盘的 history 一致。
+        _save_ckpt(latest_ckpt, model, opt, scheduler, ep + 1,
+                   history, prototypes_seq, total)
+        if args.ckpt_every > 0 and (ep + 1) % args.ckpt_every == 0:
+            _save_ckpt(os.path.join(ckpt_dir, f"{args.model}_{mode}_ep{ep+1}.pt"),
+                       model, opt, scheduler, ep + 1, history, prototypes_seq, total)
 
     elapsed = time.time() - t0
     m_final = collect_metrics(opt)
@@ -718,6 +818,10 @@ def main():
                    help="用随机数据代替 CIFAR-10 (验证代码链路, 不需下载数据集)")
     p.add_argument("--legacy-data", action="store_true",
                    help="用旧的 PIL 逐张解码数据管道 (慢, 仅用于对照)")
+    p.add_argument("--resume", action="store_true",
+                   help="从 {out}/checkpoints/{model}_{mode}_latest.pt 断点续训")
+    p.add_argument("--ckpt-every", type=int, default=10, dest="ckpt_every",
+                   help="每 N 个 epoch 额外存一份快照 (0=只存 latest, 默认 10)")
     p.add_argument("--modes", default="baseline,daco")
     args = p.parse_args()
 

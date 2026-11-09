@@ -95,3 +95,44 @@ oto.construct_subnet(out_dir='./')
 - `tutorials/`: Jupyter notebooks with usage examples
 - `test_scripts/`: Extended test scripts for various architectures
 - `tools/`: Visualization utilities
+
+## Commit Message Convention
+
+每次提交必须遵循 `[<type>] <subject>` 格式：方括号内为改动类型，空一格后写描述。
+
+```text
+[feat] GETA 优化器加入 Langevin 噪声注入
+[fix] 修正断点续训时学习率退火被重置的问题
+[chore] 移除 WORKLOG.md 的版本跟踪
+```
+
+规则：
+
+1. **必须以方括号类型标签开头**，类型小写，其后恰好一个空格再接描述。
+2. **描述用祈使句**，说明"做了什么"，不加句号，建议 50 字以内。
+3. **一次提交只做一件事**，不要把功能、修复、格式化混在同一个 commit 里。
+4. 需要限定范围时可加可选的 scope：`[feat](plot) 双联合并图 fig_combined`，不强制。
+5. 禁止无意义的提交信息（如 `update`、`修改`、`fix bug`、`.`）。
+
+类型清单：
+
+| 类型 | 用途 |
+| --- | --- |
+| `feat` | 新增功能 |
+| `fix` | 修复缺陷 |
+| `docs` | 仅文档变更 |
+| `style` | 格式调整（空白、缩进、分号），不影响逻辑 |
+| `refactor` | 重构，不改变外部行为 |
+| `perf` | 性能优化 |
+| `test` | 测试用例或测试脚本 |
+| `chore` | 构建、依赖、配置、杂项清理 |
+| `revert` | 回滚此前的提交 |
+
+示例（对应本仓库的实际工作）：
+
+```text
+[feat] DACO 双联对比图输出 fig_combined.png
+[fix] 重要性打分跨实验状态未清空导致分数漂移
+[perf] 逐层 BOPs 统计改为缓存累计
+[chore] 停止跟踪训练产物 scores_log_raw.txt
+```

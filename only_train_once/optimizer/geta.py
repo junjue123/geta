@@ -468,16 +468,35 @@ class GETA(BaseHybridSparseOptimizer):
             self.curr_pruning_period
         ]
 
-        # --- [DACO - RCAJS] 使用 Lagrangian 自适应剪枝率替换固定预算 ---
-        rcajs_state = self.rcajs.step(
-            num_pruned_groups=len(self.pruned_group_idxes),
-            score_dist=global_scores,
-        )
-        # 用 RCAJS 剪枝率计算本次 period 应剪枝的组数
-        # rate * total_groups 得到本次总共要剪的，再减去已剪的
-        rcajs_adaptive_K = int(math.ceil(rcajs_state["prune_rate"] * self.total_num_groups))
-        # 与原固定预算取较小值（保守策略），避免超过 period 预算
-        curr_active_num_adaptive = min(rcajs_adaptive_K, curr_active_num_redundant_groups)
+        # 预算模式:
+        #   "fixed" — 纯 GETA: 只用预生成的固定预算数组, 完全不调用 RCAJS。
+        #             baseline 必须是这个模式, 否则 exp(-βΔ)/Ψ 仍会改变剪枝节奏。
+        #   "rcajs" — DACO: 由 Lagrangian 闭环决定本期剪枝组数。
+        budget_mode = getattr(self, "prune_budget", "rcajs")
+
+        if budget_mode == "fixed":
+            curr_active_num_adaptive = curr_active_num_redundant_groups
+            rcajs_state = {
+                "prune_rate": 0.0,
+                "current_sparsity": len(self.pruned_group_idxes) / max(self.total_num_groups, 1),
+                "delta_p": 0.0, "stability_term": 1.0, "kl_div": 0.0,
+                "early_stop": False,
+            }
+        else:
+            rcajs_state = self.rcajs.step(
+                num_pruned_groups=len(self.pruned_group_idxes),
+                score_dist=global_scores,
+            )
+            # 用 RCAJS 剪枝率计算本次 period 应剪枝的组数
+            rcajs_adaptive_K = int(math.ceil(
+                rcajs_state["prune_rate"] * self.total_num_groups))
+            # 对"剩余到目标的组数"取小, 而不是对固定预算取小。
+            # 原先 min(..., fixed) 在 periods 很大时 (每 epoch 一次) 会把
+            # RCAJS 的余弦速率永久压到线性预算上, 自适应项等于失效。
+            remain_to_target = max(
+                0, int(self.total_num_groups * self.target_sparsity)
+                - len(self.pruned_group_idxes))
+            curr_active_num_adaptive = min(rcajs_adaptive_K, remain_to_target)
 
         if rcajs_state["early_stop"]:
             curr_active_num_adaptive = 0
@@ -1258,7 +1277,14 @@ class GETA(BaseHybridSparseOptimizer):
                 #     f"Joint pruning and quantization stage. Step={self.num_steps}"
                 # )
                 decay_factor = self._get_diffusion_decay_factor()
-                if self.pruning_period_duration != 0 and t == 0:
+                # 原条件 t==0 是死日志: t==0 恰好落在"上一期索引已 commit 清空、
+                # 本期尚未 identify"的那一步, n_nonempty 恒为 0, 该分支进不去,
+                # 于是 [DACO][DIFFUSION] 全程一条都不打。噪声其实一直在加。
+                # 改为每个剪枝期首次进入时打一次。
+                if (self.pruning_period_duration != 0
+                        and getattr(self, "_diff_log_period", -1)
+                        != self.curr_pruning_period):
+                    self._diff_log_period = self.curr_pruning_period
                     self.logger.info(
                         f"[DACO][DIFFUSION] step={self.num_steps} decay={decay_factor:.4e} "
                         f"noise_init={self.diffusion_noise_init} noise_ratio={self.diffusion_noise_ratio} "
