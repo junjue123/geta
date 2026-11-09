@@ -120,28 +120,25 @@ class SymQuantizerNonLinear(torch.autograd.Function):
         q_s: torch.Tensor,
     ) -> torch.Tensor:
         input_abs = torch.abs(input)
-        device = input.device
 
-        # Ensure all tensors are on the same device
-        d_quant = d_quant.to(device)
-        q_m = q_m.to(device)
-        t_quant = t_quant.to(device)
-        clip_val = clip_val.to(device)
-        q_s = q_s.to(device)
+        # 性能: 量化参数与 input 恒在同一 device/已是目标张量, 原来每层每步
+        # 5 次 .to(device) 纯属浪费(profile 里 aten::to 一步 500+ 次调用)。
         ctx.save_for_backward(input, d_quant, q_m, t_quant, clip_val, q_s)
 
         # q_m <= q_s can happen
         # Clamp to avoid log(negative) -> NaN when input_abs < q_s
         d_safe = torch.clamp(d_quant, min=1e-8)
-        range_pow = torch.exp(t_quant * torch.log(torch.abs(q_m - q_s) + 1e-6))
+        rng = torch.abs(q_m - q_s) + 1e-6
+        # 性能: pow(x, t) 比 exp(t*log(x)) 少两个全张量 kernel, 数值等价 (x > 0)
+        range_pow = torch.pow(rng, t_quant)
         input_diff = torch.clamp(input_abs - q_s, min=1e-8)  # avoid log(negative)
-        # 性能: pow(x, t) 比 exp(t*log(x)) 少一个全张量 kernel, 数值等价 (x > 0)
         input_pow = torch.pow(input_diff, t_quant)
 
         # 性能: 用 torch.where 替代布尔索引赋值(output[mask]=v 会触发分散写, 慢 ~24%)
         sat_val = d_safe * torch.round(range_pow / d_safe)  # 标量: 饱和值
         output = d_safe * torch.round(input_pow / d_safe)
-        output = torch.where(input_abs <= q_s, torch.zeros_like(output), output)
+        # 性能: masked_fill 原地填 0, 省掉 zeros_like 的全张量分配
+        output = output.masked_fill(input_abs <= q_s, 0.0)
         output = torch.where(input_abs >= q_m, sat_val.expand_as(output), output)
         output = torch.sign(input) * output
         # Guard against inf/nan from extreme quantization parameters.
@@ -169,10 +166,8 @@ class SymQuantizerNonLinear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output) -> Tuple[torch.Tensor]:
         input, d_quant, q_m, t_quant, clip_val, q_s = ctx.saved_tensors
-        device = input.device
         input_abs = torch.abs(input)
         sign_in = torch.sign(input)
-        zero = torch.zeros_like(input_abs)
 
         # 直通估计: 裁剪区间外的梯度置零。
         # masked_fill 比 clone + 两次布尔索引赋值少 2 个 kernel。
@@ -182,8 +177,10 @@ class SymQuantizerNonLinear(torch.autograd.Function):
         # Useful quantities — clamp to avoid log(negative) -> NaN and division by tiny d
         d_safe = torch.clamp(d_quant, min=1e-8)
         rng = torch.abs(q_m - q_s) + 1e-6  # q_m <= q_s can happen
-        range_pow = torch.exp(t_quant * torch.log(rng))
-        range_pow_low = torch.exp((t_quant - 1) * torch.log(rng))
+        # 性能: pow 比 exp(t*log(x)) 少两个全张量 kernel, 数值等价 (x > 0)
+        range_pow = torch.pow(rng, t_quant)
+        # 性能: rng^(t-1) = rng^t / rng, 省一次 pow
+        range_pow_low = range_pow / rng
         input_diff = torch.clamp(input_abs - q_s, min=1e-8)  # avoid log(negative)
         # 性能: pow 比 exp(t*log(x)) 少一个全张量 kernel, 数值等价 (x > 0)
         input_pow = torch.pow(input_diff, t_quant)
@@ -203,11 +200,12 @@ class SymQuantizerNonLinear(torch.autograd.Function):
             (torch.round(rq) - rq).expand_as(grad_d_xq),
             grad_d_xq,
         )
-        grad_d_xq = torch.where(mask_le_qs, zero, grad_d_xq)
+        # 性能: masked_fill 省掉 zeros_like 的全张量分配
+        grad_d_xq = grad_d_xq.masked_fill(mask_le_qs, 0.0)
         grad_d = (gs * grad_d_xq).sum().reshape(1)
 
         # ---- q_m 梯度: 仅 input_abs > q_m 非零, 系数为标量 -> 先归约再乘常数 ----
-        g_qm = torch.where(input_abs <= q_m, zero, gs)
+        g_qm = gs.masked_fill(input_abs <= q_m, 0.0)
         grad_qm = (g_qm.sum() * (t_quant * range_pow_low)).reshape(1)
 
         # ---- t_quant 梯度: input_pow * log(input_diff) ----
@@ -217,7 +215,7 @@ class SymQuantizerNonLinear(torch.autograd.Function):
             (range_pow * torch.log(rng)).expand_as(grad_t_xq),
             grad_t_xq,
         )
-        grad_t_xq = torch.where(mask_le_qs, zero, grad_t_xq)
+        grad_t_xq = grad_t_xq.masked_fill(mask_le_qs, 0.0)
         grad_t = (gs * grad_t_xq).sum().reshape(1)
 
         # NaN/Inf 处理: warn 策略下告警并清零, strict 策略下直接抛错 (原版行为)
