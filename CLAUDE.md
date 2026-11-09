@@ -127,9 +127,30 @@ python train.py configs/xxx.yaml --quick-test      # 冒烟: 1 epoch, 无 warmup
 新增一个实验：复制 `configs/compare_resnet20.yaml`，改 `model` / `modes` / 超参即可，
 不需要写新脚本。
 
+### 目录结构
+
+```
+geta-main_origin/
+├── train.py              # 唯一训练入口
+├── configs/              # YAML 配置 (正式) + legacy/ (旧格式)
+├── only_train_once/      # 核心框架包 (optimizer / quantization / graph / distillation ...)
+├── sanity_check/         # 测试后端与模型定义
+├── scripts/              # 工具脚本: 诊断 diag_*, 测试 run_*_test, 出图 plot_*,
+│                         #          性能 profile_*, 数据下载, CR 统计等
+├── deployment/           # cuda_kernels/ (生成的 CUDA 核) + frontend/ (配置 UI)
+├── cloud_autodl/         # 云端训练脚本
+├── docs/                 # 实验报告与说明 (本地 *.md 规则下不入库)
+├── legacy/               # 已弃用脚本
+├── outputs/              # 训练产物 (gitignore)
+└── temp/                 # 运行期打分日志与中间图 (gitignore)
+```
+
+`scripts/` 下的脚本用 `os.path.dirname(os.path.dirname(__file__))` 定位项目根，
+可以任意层级调用（如 `python scripts/compute_cr.py`）。
+
 ### 已弃用的入口
 
-- `run_daco_cifar10.py`：旧训练入口，其 `cooldown_epochs` 已并入 `train.py`；
+- `legacy/run_daco_cifar10.py`：旧训练入口，其 `cooldown_epochs` 已并入 `train.py`；
   仅保留用于 `--hparam/--hvalue` 超参扫描的历史复现。旧配置在 `configs/legacy/` 下。
 - `configs/legacy/*.yaml`：给旧入口用的格式，不要用于新实验。
 
