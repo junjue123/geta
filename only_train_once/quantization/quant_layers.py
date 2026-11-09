@@ -445,11 +445,26 @@ class QuantizeMixin:
         self.quant_mode = quant_mode
         self.weight_clip_val = weight_clip_val
         self.act_clip_val = act_clip_val
+        # 性能: clip_val 与零在训练全程恒定, 原来每次 forward 都 torch.tensor(...)
+        # 重建一次(每次都是一次 pageable 的 H2D 同步拷贝)。注册成非持久化 buffer
+        # 后随 .to(device) 自动迁移, 直接复用; 导出 ONNX 时也作为常量输入而非烧死。
+        self.register_buffer(
+            "_weight_clip_t",
+            torch.tensor(weight_clip_val, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_act_clip_t",
+            torch.tensor(act_clip_val, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer("_q_s_zero", torch.zeros((), dtype=torch.float32), persistent=False)
 
     def quantize_weight(self, weight: torch.tensor) -> torch.Tensor:
         """Quantize the weight tensor."""
-        weight_clip_val = torch.tensor(self.weight_clip_val, device=weight.device)
-        q_s = torch.tensor(0.0, device=weight.device)
+        # 性能: 复用 buffer, 不再每层每步 torch.tensor(...) 做 H2D 拷贝
+        weight_clip_val = self._weight_clip_t
+        q_s = self._q_s_zero
         quantizer = _get_quantizer(self.quant_type)
         if self.quant_type == QuantizationType.SYMMETRIC_LINEAR:
             # Symmetric linear
@@ -475,8 +490,9 @@ class QuantizeMixin:
         if self.quant_mode != QuantizationMode.WEIGHT_AND_ACTIVATION:
             return activation
 
-        activation_clip_val = torch.tensor(self.act_clip_val, device=activation.device)
-        q_s = torch.tensor(0.0, device=activation.device)
+        # 性能: 复用 buffer, 不再每层每步 torch.tensor(...) 做 H2D 拷贝
+        activation_clip_val = self._act_clip_t
+        q_s = self._q_s_zero
         quantizer = _get_quantizer(self.quant_type)
 
         if self.quant_type == QuantizationType.SYMMETRIC_LINEAR:
