@@ -1020,6 +1020,34 @@ def run_experiment(args, mode):
         _log("RESUME", f"{mode} 从 {resume_path} 恢复, 已完成 {start_ep} epoch, "
                        f"num_steps={opt.num_steps}")
 
+    # 只灌权重、不当续训: 用于"拿热身完的权重当起点, 从 ep0 重开 15 期压缩调度"。
+    # 与 --resume-from 的区别: 后者保留 epoch 计数/优化器/调度器状态, 是真正的接续;
+    # 前者是"新的实验, 旧权重", 压缩期号从第 1 期开始。
+    init_path = getattr(args, "init_from", None)
+    if init_path:
+        if not os.path.exists(init_path):
+            raise SystemExit(f"[INIT] --init-from 指定的 {init_path} 不存在")
+        sd = torch.load(init_path, map_location=device, weights_only=False)
+        if isinstance(sd, dict):
+            for k in ("model", "model_state_dict", "state_dict"):
+                if isinstance(sd.get(k), dict):
+                    sd = sd[k]
+                    break
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        fatal = [k for k in missing if "quant" not in k and "scale" not in k]
+        if fatal:
+            raise SystemExit(f"[INIT] {init_path} 权重对不上, 缺关键参数: {fatal[:6]}")
+        _log("INIT", f"{mode} 只用 {init_path} 的权重起步(epoch 从 0 重数, "
+                     f"调度器/优化器全新; 非续训)")
+
+    # 续训起点已经越过本次总 epoch 时, 循环会一次都不跑, 静默存个 final 就退出。
+    # 这个坑真的踩过(distill_from100 10 秒 rc=0, spars=0): 必须在这里拦。
+    if start_ep >= total:
+        raise SystemExit(
+            f"[RESUME] 起点 ep{start_ep} >= 本次总 epoch {total}, 训练循环会空转。"
+            f" 想'从该权重起跑新一段压缩+蒸馏'请改用 --init-from {resume_path};"
+            f" 想真正接着跑请把 epochs 设成 > {start_ep}。")
+
     t0 = time.time()
 
     runtime = None
@@ -1189,6 +1217,7 @@ _YAML_TO_ARG = {
     "projection_steps": "projection_steps", "pruning_steps": "pruning_steps",
     # 续训: 允许写在 yaml 里, 这样"起一个实验=改 yaml"成立(命令行 --resume-from 优先级更高)
     "resume_from": "resume_from", "resume": "resume",
+    "init_from": "init_from",
 }
 
 # yaml 里允许出现但不是顶层标量的块
@@ -1430,6 +1459,9 @@ def main():
                    metavar="PATH",
                    help="从指定 ckpt 续训(优先于 --resume), 例如 warmup 结束的 "
                         "resnet20_daco_ep15.pt; 改代码后复用已完成的前段用这个")
+    p.add_argument("--init-from", default=None, dest="init_from", metavar="PATH",
+                   help="只灌权重、从 ep0 重开调度(用于拿热身权重起跑压缩+蒸馏); "
+                        "与 --resume-from 不同, 不继承 epoch 计数/优化器/调度器")
     p.add_argument("--ckpt-every", type=int, default=10, dest="ckpt_every",
                    help="每 N 个 epoch 额外存一份快照 (0=只存 latest, 默认 10)")
     p.add_argument("--modes", default="baseline,daco")

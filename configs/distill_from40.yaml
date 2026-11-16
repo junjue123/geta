@@ -13,8 +13,10 @@ model: resnet20
 modes: daco
 quant_mode: weight_and_activation
 
+init_from: outputs/warmup_40/checkpoints/resnet20_baseline_ep40.pt
 epochs: 8              # joint; 本地 4060 上约 70 min, 够看机制是否在工作
-warmup_epochs: 0
+warmup_init_from: outputs/warmup_40/checkpoints/resnet20_baseline_ep40.pt
+epochs: 0
 seed: 1
 deterministic: false
 lr: 0.001
