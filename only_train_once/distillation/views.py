@@ -7,17 +7,23 @@
 这两个约定写死在这里, 换数据集时需要同步 image mean/std, 见 distill_example.yaml 注释。
 """
 
+import math
 import random
 
 import torch
+import torch.nn.functional as F
 
 
 # severity -> 每种增广的强度。数值是"归一化空间"的尺度, 不是像素尺度。
 SEVERITY = {
-    "light": {"crop": 2, "color": 0.05, "erase": 8},
-    "mid":   {"crop": 4, "color": 0.10, "erase": 12},
-    "heavy": {"crop": 6, "color": 0.20, "erase": 16},
+    "light": {"crop": 2, "color": 0.05, "erase": 8, "rotate": 5},
+    "mid":   {"crop": 4, "color": 0.10, "erase": 12, "rotate": 10},
+    "heavy": {"crop": 6, "color": 0.20, "erase": 16, "rotate": 15},
 }
+
+# 视图组真正支持的算子。yaml 里写了别的名字必须在运行时报出来, 不能静默丢弃
+# (否则 augment_modes 写了六种, 实际只生成了三种, 组内结构就悄悄变了)。
+SUPPORTED = {"identity", "crop", "flip", "color", "erase", "cutout", "rotate"}
 
 
 def _rand_crop(x, pad, gen):
@@ -62,6 +68,20 @@ def _cutout(x, size, gen):
     return out
 
 
+def _rotate(x, deg, gen):
+    """逐样本小角度旋转; 用 affine_grid + grid_sample, 不依赖 torchvision。"""
+    b = x.shape[0]
+    ang = (torch.rand(b, generator=gen) * 2 - 1) * math.radians(deg)
+    c, s = torch.cos(ang), torch.sin(ang)
+    theta = torch.zeros(b, 2, 3)
+    theta[:, 0, 0] = c
+    theta[:, 0, 1] = -s
+    theta[:, 1, 0] = s
+    theta[:, 1, 1] = c
+    grid = F.affine_grid(theta.to(x.device), x.shape, align_corners=False)
+    return F.grid_sample(x, grid, align_corners=False, padding_mode="zeros")
+
+
 def make_views(x, modes, severity="mid", group_size=8, gen=None, seed=None):
     """返回 [(视图名, 张量), ...], 第 0 项永远是 identity(干净视图)。
 
@@ -87,6 +107,11 @@ def make_views(x, modes, severity="mid", group_size=8, gen=None, seed=None):
             ops.append(("color", lambda t, g: _color_jitter(t, strength["color"], g)))
         elif m == "erase":
             ops.append(("erase", lambda t, g: _cutout(t, strength["erase"], g)))
+        elif m == "cutout":
+            # cutout 与 erase 是同一个算子(RandomErasing 的别名), 显式合并而不是忽略
+            ops.append(("cutout", lambda t, g: _cutout(t, strength["erase"], g)))
+        elif m == "rotate":
+            ops.append(("rotate", lambda t, g: _rotate(t, strength["rotate"], g)))
 
     views = [("identity", x)]
     if not ops:

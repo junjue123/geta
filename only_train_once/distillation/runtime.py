@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 
 from .teachers import TeacherPool
-from .views import make_views, view_diversity
+from .views import SUPPORTED, make_views, view_diversity
 
 
 class _TapCapture:
@@ -63,6 +63,31 @@ class _TapCapture:
 
 def _logits(out):
     return out[0] if isinstance(out, tuple) else out
+
+
+class _bn_eval:
+    """把 BN 临时切到 eval。
+
+    视图与取特征的前向会各走一遍, 若保持 train 模式, 每步 BN 的 running stats
+    会被更新 G+2 次而不是 1 次 —— 等于把 BN 的动量放大一个数量级, 且被合成视图
+    污染。这里只冻结"额外前向", 主前向仍按 train 走。
+    """
+
+    def __init__(self, model):
+        self.model = model
+        self.mods = []
+
+    def __enter__(self):
+        for m in self.model.modules():
+            if isinstance(m, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d)) and m.training:
+                m.eval()
+                self.mods.append(m)
+        return self
+
+    def __exit__(self, *a):
+        for m in self.mods:
+            m.train()
+        self.mods = []
 
 
 class DistillRuntime:
@@ -122,12 +147,20 @@ class DistillRuntime:
             if feat is not None:
                 total = feat if total is None else total + feat
 
+        # 视图的随机种子跟着 step 走: 种子恒定时每步生成的是同一批视图,
+        # 组内多样性会退化成"只有一张图", 优势也跟着退化。
+        self.step += 1
         return total, stats
 
     # ---- 决策层: GRPO 组内优势 ----
     def _decision_loss(self, X, y, clean_logits):
         d = self.cfg["decision"]
         rw = d["reward"]
+        unknown = [m for m in d["augment_modes"] if m not in SUPPORTED]
+        if unknown:
+            self._warn_once("bad_modes",
+                            f"augment_modes 里有未实现的算子 {unknown}, 已忽略; "
+                            f"支持 {sorted(SUPPORTED)}")
         views = make_views(X, d["augment_modes"], d["severity"],
                            group_size=int(d["group_size"]), seed=self.step)
         if len(views) < 2:
@@ -138,21 +171,22 @@ class DistillRuntime:
         clean_pred = clean_logits.argmax(1).detach()
         rewards = []
         logps = []
-        for name, v in views:
-            out_s = _logits(self.model(v))
-            logp = F.log_softmax(out_s, dim=1)
-            logps.append(logp.gather(1, y.view(-1, 1)).squeeze(1))
+        with _bn_eval(self.model):
+            for name, v in views:
+                out_s = _logits(self.model(v))
+                logp = F.log_softmax(out_s, dim=1)
+                logps.append(logp.gather(1, y.view(-1, 1)).squeeze(1))
 
-            r = torch.zeros_like(y, dtype=torch.float32)
-            if rw["correctness"]:
-                r = r + (out_s.argmax(1) == y).float()
-            if rw["teacher_agreement"] > 0 and self.pool.has_cf:
-                with torch.no_grad():
-                    pred_cf = _logits(self.pool.cf(v)).argmax(1)
-                r = r + rw["teacher_agreement"] * (out_s.argmax(1) == pred_cf).float()
-            if rw["clean_consistency"] > 0:
-                r = r + rw["clean_consistency"] * (out_s.argmax(1) == clean_pred).float()
-            rewards.append(r.detach())
+                r = torch.zeros_like(y, dtype=torch.float32)
+                if rw["correctness"]:
+                    r = r + (out_s.argmax(1) == y).float()
+                if rw["teacher_agreement"] > 0 and self.pool.has_cf:
+                    with torch.no_grad():
+                        pred_cf = _logits(self.pool.cf(v)).argmax(1)
+                    r = r + rw["teacher_agreement"] * (out_s.argmax(1) == pred_cf).float()
+                if rw["clean_consistency"] > 0:
+                    r = r + rw["clean_consistency"] * (out_s.argmax(1) == clean_pred).float()
+                rewards.append(r.detach())
 
         R = torch.stack(rewards, dim=1)                     # [B, G]
         adv = R - R.mean(dim=1, keepdim=True)
@@ -181,7 +215,8 @@ class DistillRuntime:
             t = self.pool.primary_hist()
             with torch.no_grad():
                 t_logits = _logits(t(X))
-            kl = F.kl_div(F.log_softmax(_logits(self.model(X)), dim=1),
+            # 复用主前向的 logits(带梯度), 不再为 ref 位单独跑一遍学生前向
+            kl = F.kl_div(F.log_softmax(clean_logits, dim=1),
                           F.log_softmax(t_logits, dim=1),
                           log_target=True, reduction="batchmean")
             dec = dec + beta * kl
@@ -193,13 +228,15 @@ class DistillRuntime:
         f = self.cfg["feature"]
         names = list(f["taps"])
         taps_s = _TapCapture(self.model, names)
-        with taps_s:
+        with _bn_eval(self.model), taps_s:
             _logits(self.model(X))              # 这一条前向为了拿中间层, 图必须保留
         feats_s = dict(taps_s.store)
 
         t = self.pool.primary_hist()
         taps_t = _TapCapture(t, names)
-        with torch.no_grad(), taps_t:
+        # 教师侧也锁 BN: 否则学生用 running stats、教师用 batch stats(KL 会凭空变大)。
+        # 正常情况教师已 eval, 这层保护对影子教师(与学生同结构)才有实际作用。
+        with torch.no_grad(), _bn_eval(t), taps_t:
             _logits(t(X))
         feats_t = dict(taps_t.store)
 

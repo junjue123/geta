@@ -27,11 +27,12 @@ def main():
 
     print("T1 视图组: 第0项必须是 identity, 总数等于 group_size, 组内要有差异")
     x = torch.randn(4, 3, 32, 32)
-    vs = make_views(x, ["identity", "crop", "flip", "color", "erase"],
+    vs = make_views(x, ["identity", "crop", "flip", "color", "erase", "rotate"],
                     "mid", group_size=8, seed=1)
     assert len(vs) == 8, len(vs)
     assert vs[0][0] == "identity" and torch.equal(vs[0][1], x)
     assert view_diversity(vs) > 0.01, view_diversity(vs)
+    assert all(t.shape == x.shape for _, t in vs), "视图尺寸必须与原图一致"
     print(f"  [ok] 8 个视图, 组内平均相对偏离 {view_diversity(vs):.4f}")
 
     print("\nT2 只有 identity 时不应造假视图(否则优势恒为 0)")
@@ -43,7 +44,7 @@ def main():
     # view_diversity 把四种算子混在一起取平均, 不是严重强度指标;
     # 这里直接检查强度表, 并用 color 做一次实证(它的扰动幅度严格正比于 scale)。
     from only_train_once.distillation.views import SEVERITY
-    for k in ("crop", "color", "erase"):
+    for k in ("crop", "color", "erase", "rotate"):
         vals = [SEVERITY[s][k] for s in ("light", "mid", "heavy")]
         assert vals[0] < vals[1] < vals[2], (k, vals)
     devs = []
@@ -174,6 +175,28 @@ def main():
         print(f"  [ok] 已加载 {real.name} ({n_ref/1e6:.1f}MB), 冻结状态正确")
     else:
         print(f"  [skip] 找不到 {real}, 跳过(该测试依赖已有训练产物)")
+
+    print("\nT10 视图随机种子必须跟着 step 走, 且额外前向不能污染 BN 统计")
+    s0 = rt_stub.step
+    rt_stub.extra_loss(X, y, torch.zeros(X.size(0), 10))
+    assert rt_stub.step == s0 + 1, f"extra_loss 没有推进 step: {s0} -> {rt_stub.step}"
+    cfg_bn = DC.resolve({"enabled": True,
+                         "teacher": {"cf": {"enabled": True}},
+                         "decision": {"enabled": True, "group_size": 4,
+                                      "augment_modes": ["identity", "flip", "crop"]}})
+    model.train()
+    rt_bn = DistillRuntime(cfg_bn, model, torch.nn.CrossEntropyLoss(),
+                           torch.device("cpu"), str(ROOT / "no_such_dir"),
+                           "resnet20", "daco",
+                           lambda: build_model("resnet20", torch.device("cpu"))[0])
+    bns = [m for m in model.modules() if isinstance(m, torch.nn.BatchNorm2d)]
+    assert bns, "模型里没有 BN, 该断言无意义"
+    rm_before = [m.running_mean.clone() for m in bns]
+    # 只跑 extra_loss(不跑主前向), 这样若 BN 统计被改写就一定是视图前向干的
+    rt_bn.extra_loss(X, y, torch.zeros(X.size(0), 10))
+    moved = sum(1 for m, a in zip(bns, rm_before) if not torch.equal(m.running_mean, a))
+    assert moved == 0, f"{moved} 个 BN 的 running_mean 被视图前向改写了"
+    print(f"  [ok] step={rt_stub.step}, {len(bns)} 个 BN 统计未被额外前向改动")
 
     print("\n[ok] 运行时单元测试全部通过")
 

@@ -596,7 +596,8 @@ def train_one_epoch(model, opt, loader, criterion, device, epoch, scheduler,
         stats = {}
         if runtime is not None:
             # 三项里只有 decision/feature 是损失; weight 在 opt.step() 之后做投影。
-            extra, stats = runtime.extra_loss(X, y, out.detach())
+            # 传带梯度的 out(而不是 detach), 让 ref 位复用主前向, 少跑一遍学生前向。
+            extra, stats = runtime.extra_loss(X, y, out)
             if extra is not None:
                 loss = loss + extra
         opt.zero_grad()
