@@ -1,0 +1,86 @@
+# =============================================================================
+# 第3章蒸馏开关组: 参考配置(可直接粘到 compare_resnet20.yaml 等任意配置里)
+#
+# 用法:
+#   python train.py configs/compare_resnet20.yaml            # 不加 distill 块 = 全关
+#   python train.py configs/xxx.yaml                          # 加了下面这块 = 启用
+#   python train.py configs/xxx.yaml --distill-...            # (命令行覆盖见文末)
+#
+# 设计: 一个总开关 + 六个机制开关, 全关时训练行为与纯第2章 DACO 完全一致。
+# 关掉某个机制不需要改代码 —— 这是"缺失对照"实验的前提(机制本身不删, 只关)。
+# =============================================================================
+
+distill:
+  enabled: true                 # 总开关
+
+  # ---------------------------- 教师集合 ----------------------------
+  teacher:
+    source: trajectory          # trajectory | none
+    hist:                       # T_hist: 可靠教师(做软标签/特征锚/ref)
+      enabled: true
+      max_count: 2              # K_hist <= 2
+      require_warmup_mid: true  # 必须含热身中段快照(IB 论断的可证伪点)
+      coordinate: compression   # 按压缩程度等距取, 而非按 epoch 等距
+      admit_acc_delta: 0.02     # acc >= acc(theta_t) - 0.02 才准入
+      weight: ib                # ib | uniform
+    cf:                         # T_cf: 反事实教师(只做逐视图密集奖励)
+      enabled: true
+      implement: shadow         # shadow(推荐, 内存≈被剪参数的10-30%) | none
+      views: 2                  # 参与 reward 的代表视图数
+
+  # ---------------------------- 决策层 ----------------------------
+  decision:
+    enabled: true
+    group_size: 8               # G: 每样本视图数
+    augment_modes: [identity, crop, flip, color, cutout, rotate]
+    severity: mid               # light | mid | heavy (D0-C 决定)
+    reward:
+      correctness: true         # 1[pred==y]       (二值项)
+      teacher_agreement: 1.0    # lambda_T: T_cf 认可度  (主密集项)
+      clean_consistency: 0.5    # lambda_C: 与干净视图同判且都对
+    advantage:
+      normalize_std: false      # false = Dr.GRPO(去 std); true 会把模型推向高置信错判
+      mode: positive            # positive(只留正优势) | signed
+    ref_kl:                     # 压缩后策略漂移的锚(GRPO 里唯一剩下的 ref 位)
+      enabled: true
+      beta: 0.03
+      views: clean
+
+  # ---------------------------- 表征层 ----------------------------
+  feature:
+    enabled: true
+    taps: [layer2, layer3, avg_pool]    # resnet20 无 layer4; 按 D0-B 结果改
+    pick: fixed                 # fixed | deviation(按偏离量选)
+    divergence: forward         # forward(FKL) | reverse(RKL) —— 3x2 表对照
+    budget: sensitivity         # uniform(均分, 简单版) | sensitivity(按 s_l)
+    alpha: 1.0
+
+  # ---------------------------- 参数层 ----------------------------
+  weight:
+    enabled: true
+    epsilon0: 0.01              # 基础半径
+    kappa: 1.0                  # epsilon_lc = epsilon0 * (s_bar/s_lc)^kappa
+    schedule: tighten           # tighten(压缩事件收紧 + 之后余弦放开) | constant
+    anchor: pre_compression     # pre_compression | init
+
+  # ---------------------------- 诊断(只读) ----------------------------
+  diagnostics:
+    effective_rank:
+      enabled: true
+      p_star: 0.9               # I5: r_eff 低于该比例说明压缩该停
+      every_steps: 50
+
+
+# =============================================================================
+# 三套配置(A/B/C)的差异, 对应 §23 的 E6: 全部保留机制, 只差实现细节
+#
+#   配置 A(最简)  : feature.budget=uniform, feature.taps=[layer2,layer3,avg_pool],
+#                   weight.kappa=1.0, decision.ref_kl.enabled=false
+#   配置 B(标准)  : 如上文
+#   配置 C(激进)  : 上 B + weight.schedule=constant(更紧) + severity=heavy
+#
+# 用命令行覆盖, 不必复制三份 yaml:
+#   python train.py cfg.yaml --set-distill "decision.severity=heavy" \
+#                                    "feature.budget=uniform"
+# (train.py 里的实现见 distill_overrides 列表, 或脚本内 DC.apply_overrides)
+# =============================================================================

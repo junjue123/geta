@@ -152,6 +152,7 @@ def dump_run_config(args, path):
             "args": {k: v for k, v in sorted(vars(args).items())},
             "paper_defaults": dict(sorted(PAPER_DEFAULTS.items())),
             "baseline_override": dict(sorted(BASELINE_OVERRIDE.items())),
+            "distill": DISTILL_CFG,     # 第3章蒸馏开关组的最终生效值(None=未启用)
         }
         d = os.path.dirname(os.path.abspath(path))
         if d:
@@ -181,6 +182,10 @@ PAPER_DEFAULTS = dict(
     diffusion_noise_init=1e-4,
     diffusion_noise_ratio=0.5,
 )
+
+# 第3章蒸馏开关组: 由 yaml 的 distill 块解析而来; None 表示本次运行不启用蒸馏
+DISTILL_CFG = None
+
 
 # Baseline: 硬投影, 关闭 RCAJS 自适应 / MCSS / DGD
 BASELINE_OVERRIDE = dict(
@@ -1158,6 +1163,22 @@ def _apply_config(p):
     if bo_applied:
         _log("CONFIG", "baseline_override: " +
              ", ".join(f"{k}={v}" for k, v in sorted(bo_applied.items())))
+
+    # ---- 第3章蒸馏开关组 (distill 块)
+    # 默认全关: 不写 distill 块时, 训练行为与纯第2章 DACO 完全一致。
+    # 配置对象解析在此处完成, 非法组合在这里就报错(而不是等到 step 中途才炸)。
+    global DISTILL_CFG
+    raw_distill = cfg.get("distill")
+    if raw_distill is not None:
+        from only_train_once.distillation import config as _dcfg
+        overrides = [o for o in (cfg.get("distill_overrides") or [])]
+        DISTILL_CFG = _dcfg.resolve(raw_distill)
+        if overrides:
+            DISTILL_CFG = _dcfg.apply_overrides(DISTILL_CFG, overrides)
+        for line in _dcfg.summary_lines(DISTILL_CFG):
+            _log("DISTILL", line)
+    else:
+        DISTILL_CFG = None
 
     args = p.parse_args()
     args.config = cfg_path
