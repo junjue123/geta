@@ -139,6 +139,31 @@ def main():
     assert "distillation import config" in src, "train.py 没有调用配置解析"
     print("  [ok] 全局变量 / 解析调用 / 快照写入 三处都在")
 
+    print("\nT13 --set-distill 命令行开关(注释里承诺就得真能用)")
+    assert 'add_argument("--set-distill"' in src, \
+        "train.py 的解析器里没有 --set-distill, 命令行覆盖会直接报未知参数"
+    assert "_find_distill_overrides" in src, \
+        "缺少 _apply_config 之前的 argv 预扫描, 覆盖值会晚于配置解析"
+    assert 'a == "--set-distill"' in src and 'startswith("--set-distill=")' in src, \
+        "预扫描要同时支持 '--set-distill v' 与 '--set-distill=v' 两种写法"
+    print("  [ok] 解析器已注册, 预扫描两种写法都覆盖")
+
+    print("\nT14 配置必须能 yaml 往返(run_config.yaml 快照要能被读回来)")
+    # 曾经的 bug: validate() 往 cfg 里写 _warnings, 快照多出非 schema 键,
+    # 再 resolve() 时被判"未知键" -> 实验配置无法回溯。
+    import io
+    import yaml
+    off_with_minor = DC.resolve({"enabled": False,
+                                 "teacher": {"hist": {"enabled": True}}})
+    assert "_warnings" not in off_with_minor, "validate 又往 cfg 里塞了 _warnings"
+    dump = yaml.safe_dump({"distill": off_with_minor}, allow_unicode=True)
+    assert "_warnings" not in dump, "快照里混进了内部键"
+    back = DC.resolve(yaml.safe_load(io.StringIO(dump))["distill"])
+    assert back["teacher"]["hist"]["enabled"] is True
+    assert DC.collect_warnings(off_with_minor), "总开关关但子开关开, 应当有提示"
+    assert not DC.collect_warnings(DC.resolve({"enabled": True})), "全开时不该有提示"
+    print("  [ok] 往返一致, 提示走 collect_warnings 而不污染配置")
+
     print("\n[ok] 蒸馏开关组全部测试通过")
 
 

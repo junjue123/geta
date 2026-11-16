@@ -1068,6 +1068,21 @@ _YAML_TO_ARG = {
 }
 
 
+def _find_distill_overrides(argv):
+    """扫描命令行里的 --set-distill 'path=value'(可重复)。
+
+    _apply_config 在 argparse 建好之前就要用到覆盖值, 所以这里单独扫一遍 argv;
+    main() 的解析器里也注册了同名参数, 否则最终 parse_args 会因未知参数报错。
+    """
+    out = []
+    for i, a in enumerate(argv):
+        if a == "--set-distill" and i + 1 < len(argv):
+            out.append(argv[i + 1])
+        elif a.startswith("--set-distill="):
+            out.append(a.split("=", 1)[1])
+    return out
+
+
 def _apply_config(p):
     """加载 YAML 并转成 argparse 默认值; compression 块直接写入 PAPER_DEFAULTS。
 
@@ -1171,14 +1186,20 @@ def _apply_config(p):
     raw_distill = cfg.get("distill")
     if raw_distill is not None:
         from only_train_once.distillation import config as _dcfg
-        overrides = [o for o in (cfg.get("distill_overrides") or [])]
+        # 覆盖来源: yaml 的 distill_overrides 列表 + 命令行 --set-distill(可重复)
+        yaml_overrides = list(cfg.get("distill_overrides") or [])
+        cli_overrides = _find_distill_overrides(sys.argv[1:])
         DISTILL_CFG = _dcfg.resolve(raw_distill)
-        if overrides:
-            DISTILL_CFG = _dcfg.apply_overrides(DISTILL_CFG, overrides)
+        if yaml_overrides or cli_overrides:
+            DISTILL_CFG = _dcfg.apply_overrides(
+                DISTILL_CFG, yaml_overrides + cli_overrides)
+            _log("DISTILL", f"覆盖: {yaml_overrides + cli_overrides}")
         for line in _dcfg.summary_lines(DISTILL_CFG):
             _log("DISTILL", line)
     else:
         DISTILL_CFG = None
+        if _find_distill_overrides(sys.argv[1:]):
+            p.error("传了 --set-distill 但配置里没有 distill 块, 覆盖无处可落")
 
     args = p.parse_args()
     args.config = cfg_path
@@ -1192,6 +1213,12 @@ def main():
     p.add_argument("config", nargs="?", default=None,
                    help="YAML 配置文件, 如 configs/compare_resnet20.yaml; "
                         "命令行参数优先覆盖 yaml 中的同名项")
+    # ---- 第3章蒸馏开关组的命令行覆盖 (与 yaml 的 distill_overrides 等价) ----
+    p.add_argument("--set-distill", action="append", default=None,
+                   dest="set_distill", metavar="PATH=VALUE",
+                   help="覆盖 distill 配置, 可重复, 如 "
+                        "--set-distill decision.severity=heavy "
+                        "--set-distill feature.budget=uniform")
     p.add_argument("--model", default="resnet20", choices=["resnet20", "vgg7"])
     p.add_argument("--epochs", type=int, default=85,
                    help="joint 训练 epochs (默认 85, 配合 warmup 15 = 100 总)")

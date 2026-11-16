@@ -199,6 +199,8 @@ class DistillConfigError(ValueError):
 def _check_keys(raw, schema, prefix=""):
     """未知键 -> 报错并给出最接近的合法键; 缺失键由 defaults 补。"""
     for k, v in raw.items():
+        if k.startswith("_"):
+            continue            # 内部键(_warnings 之类)不参与校验, 保证旧快照可读回
         if k not in schema:
             legal = list(_flat(schema).keys())
             near = difflib.get_close_matches(f"{prefix}{k}", legal, n=3, cutoff=0.6)
@@ -221,6 +223,8 @@ def resolve(raw=None, strict=True):
     if strict:
         _check_keys(raw, DISTILL_DEFAULTS)
     for k, v in raw.items():
+        if k.startswith("_"):
+            continue            # 内部键(如 _warnings)忽略, 保证 yaml 快照可往返
         if k not in DISTILL_DEFAULTS:
             continue
         if isinstance(v, dict):
@@ -293,13 +297,24 @@ def validate(cfg):
                 raise DistillConfigError(f"feature.taps 含未知层 '{t}', 可选 {VALID_TAPS}")
 
     # ---- master switch: 子开关开着但总开关关着, 只提醒不报错(便于整块复制)
-    if not cfg["enabled"]:
+    # 注意: 只在 collect_warnings() 里提示, **不得往 cfg 里写**。
+    # 早先把 "distill.enabled=false, 子开关不生效" 写进 cfg["_warnings"],
+    # 结果 run_config.yaml 快照里多了一个非 schema 键, 再读回来会被
+    # _check_keys() 判成"未知键" -> 配置无法往返。这是踩过的坑。
+    return cfg
+
+
+def collect_warnings(cfg):
+    """返回"能跑但要注意"的提示列表(不修改 cfg)。"""
+    out = []
+    flat = _flat(cfg)
+    if not cfg.get("enabled"):
         minors = [k for k, v in flat.items()
                   if k.endswith(".enabled") and v is True
                   and not k.startswith("diagnostics.")]
         if minors:
-            cfg["_warnings"] = [f"distill.enabled=false, 以下子开关不会生效: {minors}"]
-    return cfg
+            out.append(f"distill.enabled=false, 以下子开关不会生效: {minors}")
+    return out
 
 
 # ===========================================================================
@@ -364,9 +379,11 @@ def summary_lines(cfg):
     d = cfg["decision"]
     if d["enabled"]:
         r = d["reward"]
+        def _onoff(v):
+            return "on" if (v is True or v == 1) else ("off" if (v is False or v == 0) else v)
         lines.append(
             f"  决策: G={d['group_size']} severity={d['severity']} "
-            f"reward=(1:{r['correctness']}, T:{r['teacher_agreement']}, "
+            f"reward=(1:{_onoff(r['correctness'])}, T:{r['teacher_agreement']}, "
             f"C:{r['clean_consistency']}) adv={d['advantage']['mode']}"
             f"(std={d['advantage']['normalize_std']}) "
             f"ref_KL={'on' if d['ref_kl']['enabled'] else 'off'}(β={d['ref_kl']['beta']})")
@@ -381,7 +398,7 @@ def summary_lines(cfg):
     if cfg["diagnostics"]["effective_rank"]["enabled"]:
         e = cfg["diagnostics"]["effective_rank"]
         lines.append(f"  I5: p*={e['p_star']} every={e['every_steps']} steps")
-    for wmsg in cfg.get("_warnings", []):
+    for wmsg in collect_warnings(cfg):
         lines.append(f"  [WARN] {wmsg}")
     return lines
 
