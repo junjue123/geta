@@ -2,10 +2,303 @@ from .magnitude import *
 from .cosine_similarity import *
 from .taylor import *
 import torch
+import os
+import logging
+import matplotlib.pyplot as plt
+import numpy as np
+import math
 
-def calculate_importance_score(criteria, param_group):
+# 结构化日志: [DACO][MCSS] layer=... crit=... cv_factor=... bit_factor=... adjusted_mean=...
+_logger = logging.getLogger("DACO.importance_score")
+
+# 分数记录目录 (由优化器 set_log_dir 覆盖, 默认 temp)
+_LOG_DIR = os.path.join("temp")
+
+
+def set_log_dir(path):
+    """设置分数记录/绘图目录 (跟随优化器 log_dir, 避免多实验写同一 temp/ 冲突)"""
+    global _LOG_DIR
+    _LOG_DIR = path
+    os.makedirs(_LOG_DIR, exist_ok=True)
+
+# --- 全局变量用于存储绘图历史 ---
+# 结构: {'layer_name': {'magnitude': [v1, v2...], 'steps': [1, 2...]}}
+_SCORE_HISTORY = {}
+
+# --- 全局变量用于存储重要性分数的全局观测边界 ---
+# 结构: {'criterion_name': [global_min, global_max]}
+# 用于 _apply_online_normalization() 的滑动最值归一化
+_GLOBAL_SCORE_BOUNDS = {}
+
+# 记录已经在哪些 step 做过"跨实验清理", 避免同一 step 内被多个 param_group 重复清空
+_CLEARED_STEPS = set()
+
+# ---------------------------------------------------------------------------
+# 【修复】在线 min-max 归一化开关
+# ---------------------------------------------------------------------------
+# 原版 GETA 只在 BaseHybridSparseOptimizer.compute_importance_scores() 里做一次
+# Frobenius 范数归一化 (sqrt(sum(score^2)), 跨层全局)。
+#
+# 本分支曾在 calculate_importance_score() 内部额外加了一遍
+# _apply_online_normalization(): 用按 criterion 名索引的**全局** min/max 做归一化。
+# 因为 bounds 的 key 是 criterion 名而不是层名, 所有层共用同一组极值,
+# 幅值小的层会被压到 ~0, 在剪枝时被整层剪空, 直接导致模型退化。
+# 这是"量化层失效"之外的第二处会破坏训练的改动, 默认关闭以对齐原版数值行为。
+ONLINE_NORMALIZE_DEFAULT = os.environ.get("OTO_ONLINE_NORM", "0") == "1"
+
+
+def set_online_normalize(enabled: bool):
+    """显式开关在线 min-max 归一化 (默认关闭, 对齐原版单次 Frobenius 归一化)"""
+    global ONLINE_NORMALIZE_DEFAULT
+    ONLINE_NORMALIZE_DEFAULT = bool(enabled)
+
+
+def reset_score_state():
+    """清空跨实验累积的全局状态。每个新实验开始前应调用一次。"""
+    _SCORE_HISTORY.clear()
+    _GLOBAL_SCORE_BOUNDS.clear()
+    _CLEARED_STEPS.clear()
+
+
+def _get_layer_name(param_group):
+    """辅助函数：统一获取层名称"""
+    layer_name = "unknown"
+    if 'p_names' in param_group and len(param_group['p_names']) > 0:
+        # 简化名称: module.layer.weight -> module_layer
+        layer_name = param_group['p_names'][0].replace(".", "_").replace("_weight", "")
+    return layer_name
+
+
+def _record_and_plot(param_group, step=None):
+    """
+    辅助函数：记录分数到 log 并绘图到 temp 文件夹
+    注意：此函数记录的是【原始/Raw】分数，用于后续计算方差。
+    """
+    # 1. 准备目录 (跟随优化器 log_dir, 由 set_log_dir 设置, 默认 temp)
+    save_dir = _LOG_DIR
+    os.makedirs(save_dir, exist_ok=True)
+    log_file = os.path.join(save_dir, "scores_log_raw.txt")
+
+    # 2. 获取层名称
+    layer_name = _get_layer_name(param_group)
+
+    # 3. 处理 Step 计数
+    if step is None:
+        if not hasattr(_record_and_plot, "internal_step"):
+            _record_and_plot.internal_step = 0
+        _record_and_plot.internal_step += 1
+        current_step = _record_and_plot.internal_step
+    else:
+        current_step = step
+
+    # 4. 初始化历史记录
+    if layer_name not in _SCORE_HISTORY:
+        _SCORE_HISTORY[layer_name] = {'steps': []}
+
+    # 防止同一个step重复记录 (幂等性检查)
+    if current_step in _SCORE_HISTORY[layer_name]['steps']:
+        return
+
+    _SCORE_HISTORY[layer_name]['steps'].append(current_step)
+
+    # 5. 提取数据并写入日志
+    try:
+        with open(log_file, "a") as f:
+            log_header = f"Step: {current_step} | Layer: {layer_name}"
+            f.write(f"{log_header}\n")
+
+            if 'importance_scores' in param_group:
+                scores_dict = param_group['importance_scores']
+                for crit_name, score_val in scores_dict.items():
+                    # 确保 crit_name 在历史记录中
+                    if crit_name not in _SCORE_HISTORY[layer_name]:
+                        _SCORE_HISTORY[layer_name][crit_name] = []
+
+                    # 计算均值用于记录和绘图
+                    if isinstance(score_val, torch.Tensor):
+                        val_scalar = score_val.float().mean().item()
+                    else:
+                        val_scalar = float(score_val)
+
+                    # 存入历史
+                    _SCORE_HISTORY[layer_name][crit_name].append(val_scalar)
+
+                    f.write(f"  - {crit_name}: {val_scalar:.6e}\n")
+            f.write("-" * 30 + "\n")
+    except Exception as e:
+        print(f"[Warning] Logging failed: {e}")
+
+    # 6. 绘图 (为了性能建议控制频率，此处保留原逻辑)
+    try:
+        # 简单优化：只在 steps 数量为 10 的倍数时绘图，避免频繁 I/O
+        if len(_SCORE_HISTORY[layer_name]['steps']) % 10 == 0:
+            plt.ioff()
+            plt.figure(figsize=(10, 6))
+            steps = _SCORE_HISTORY[layer_name]['steps']
+
+            has_data = False
+            for key, vals in _SCORE_HISTORY[layer_name].items():
+                if key == 'steps': continue
+                # 确保长度对齐
+                if len(vals) == len(steps):
+                    plt.plot(steps, vals, label=key, marker='.')
+                    has_data = True
+
+            if has_data:
+                plt.title(f"Raw Importance Scores - {layer_name}")
+                plt.xlabel("Step")
+                plt.ylabel("Score Value (Mean)")
+                plt.yscale('symlog')
+                plt.legend()
+                plt.grid(True, which="both", ls="-", alpha=0.5)
+                plt.tight_layout()
+                plt.savefig(os.path.join(save_dir, f"{layer_name}_raw_scores.png"))
+
+            plt.close()
+    except Exception as e:
+        print(f"[Warning] Plotting failed: {e}")
+
+
+def _apply_online_normalization(param_group, momentum=0.9):
+    """
+    使用滑动最值对当前层的分数进行在线归一化。
+    momentum: 如果你想让最值更偏向于近期观测到的范围，可以引入动量；
+    此处默认使用全局绝对最值以保证稳定性。
+    """
+    global _GLOBAL_SCORE_BOUNDS
+    eps = 1e-8
+
+    scores_dict = param_group.get('importance_scores', {})
+
+    for cri_name, score in scores_dict.items():
+        # 获取当前张量的局部最值
+        if isinstance(score, torch.Tensor):
+            curr_min = score.min().item()
+            curr_max = score.max().item()
+        else:
+            curr_min = curr_max = float(score)
+
+        # 更新全局观测边界
+        if cri_name not in _GLOBAL_SCORE_BOUNDS:
+            _GLOBAL_SCORE_BOUNDS[cri_name] = [curr_min, curr_max]
+        else:
+            _GLOBAL_SCORE_BOUNDS[cri_name][0] = min(_GLOBAL_SCORE_BOUNDS[cri_name][0], curr_min)
+            _GLOBAL_SCORE_BOUNDS[cri_name][1] = max(_GLOBAL_SCORE_BOUNDS[cri_name][1], curr_max)
+
+        # 执行归一化
+        g_min, g_max = _GLOBAL_SCORE_BOUNDS[cri_name]
+        denom = g_max - g_min + eps
+
+        # 直接修改 param_group 中的 tensor
+        param_group['importance_scores'][cri_name] = (score - g_min) / denom
+
+
+def adjust_importance_criteria(param_group, bit_layers, full_precision=32, history_window=5, smooth_factor = 0.8):
+    """
+    [DACO - MCSS]
+    根据 1. 历史方差波动 (稳定性 Ψ) 和 2. 当前量化位宽 (保真系数 Φ(d))
+    对重要性分数进行加权调整，直接修改 param_group['importance_scores']。
+    
+    公式: adjusted = raw * (1 - smooth) + raw * Φ(d) * Ψ * smooth
+    默认 smooth_factor=0.8 使校准因子起主导作用，对齐论文 MCSS 公式。
+    """
+    if 'importance_scores' not in param_group or not param_group['importance_scores']:
+        return
+
+    layer_name = _get_layer_name(param_group)
+
+    # --- 1. 获取位宽因子 (Bit-width Factor) ---
+    # 逻辑：位宽越小，越需要保护 (Score 变大)；位宽越大 (接近32)，相对可以被剪枝 (Score 相对变小)
+    bit_factor = 1.0
+    if bit_layers is not None:
+        # 尝试匹配 param_group 中的参数名到 bit_layers
+        target_layer_key = None
+        for p_name in param_group['p_names']:
+            # 假设 bit_layers 键值是 "module.layer" 形式
+            candidate = ".".join(p_name.split(".")[:-1])
+            if candidate in bit_layers:
+                target_layer_key = candidate
+                break
+
+        if target_layer_key:
+            # 获取权重位宽，默认为 32
+            current_bit = bit_layers[target_layer_key].get('weight', full_precision)
+            current_bit = max(current_bit, 0.1)  # 防止除零
+            # 示例: 4bit -> factor = 32/4 = 8.0 (放大分数，保护)
+            bit_factor = 1 + math.log2(full_precision/current_bit)
+
+    # --- 2. 遍历所有评分标准进行调整 ---
+    for cri_name in param_group['importance_scores']:
+        # 注: 此时分数已被 _apply_online_normalization 归一化, 变量名保留 raw_score 仅为历史兼容
+        raw_score = param_group['importance_scores'][cri_name]
+
+        # --- 计算方差因子 (Variance/Stability Factor) ---
+        stability_factor = 1.0
+        # 从全局历史中获取最近 N 步的数据来计算波动
+        if layer_name in _SCORE_HISTORY and cri_name in _SCORE_HISTORY[layer_name]:
+            history_vals = _SCORE_HISTORY[layer_name][cri_name]
+            if len(history_vals) >= 2:
+                # 取最近 window_size 个点
+                window = history_vals[-history_window:]
+                arr = np.array(window)
+
+                # 计算变异系数 (Coefficient of Variation) = std / mean
+                # 使用 CV 而不是单纯的 var，是为了消除不同 score 量级的影响
+                mean_val = np.abs(np.mean(arr))
+                if mean_val > 1e-9:
+                    cv = np.std(arr) / mean_val
+                    # 策略: 波动越大 (CV越大)，因子越小。波动为0，因子为1。
+                    # 使用 exp(-CV) 进行平滑衰减
+                    stability_factor = max(0.2, math.exp(-cv))
+                else:
+                    stability_factor = 1.0
+
+        # --- 3. 综合调整 ---
+        # Final Score = Raw * Stability * BitProtection
+        # 1. 越稳定，分数越高 (奖励稳定性)
+        # 2. 位宽越低，分数越高 (保护低位宽)
+
+        # 注意: raw_score 可能是 Tensor，保持 Tensor 操作
+        adjusted_score = raw_score*(1-smooth_factor) + raw_score * stability_factor * bit_factor * smooth_factor
+
+        # 更新回 param_group
+        param_group['importance_scores'][cri_name] = adjusted_score
+
+        # 结构化日志: 每 period 一次, 频率可控
+        raw_mean = float(raw_score.float().mean().item()) if isinstance(raw_score, torch.Tensor) else float(raw_score)
+        adj_mean = float(adjusted_score.float().mean().item()) if isinstance(adjusted_score, torch.Tensor) else float(adjusted_score)
+        _logger.info(
+            f"[DACO][MCSS] layer={layer_name} crit={cri_name} "
+            f"smooth={smooth_factor:.3f} cv_factor={stability_factor:.3f} "
+            f"bit_factor={bit_factor:.2f} raw_mean={raw_mean:.4e} adj_mean={adj_mean:.4e}"
+        )
+
+
+def calculate_importance_score(criteria, param_group, bit_layers=None, step=None,
+                               smooth_factor=0.8, online_normalize=None):
+    """
+    Args:
+        step (int, optional): 当前训练步数
+        smooth_factor (float): 校准因子混合比例，默认 0.8
+        online_normalize (bool, optional): 是否额外做在线 min-max 归一化。
+            默认 None -> 跟随 ONLINE_NORMALIZE_DEFAULT(默认 False, 对齐原版)。
+    """
+    # --- 跨会话累积清理: step==0/1 时清理本层历史 ---
+    # 避免多次训练复用同一进程时数据累积导致 CV 计算错误
+    if step is not None and step <= 1:
+        layer_name = _get_layer_name(param_group)
+        if layer_name in _SCORE_HISTORY:
+            _SCORE_HISTORY[layer_name] = {'steps': []}
+        # 【修复】_GLOBAL_SCORE_BOUNDS 的 key 是 criterion 名而非层名,
+        # 原写法 `if layer_name in _GLOBAL_SCORE_BOUNDS` 永远不成立 -> 跨实验污染。
+        # 正确做法是整体清空, 且同一 step 只清一次(否则后续 param_group 会抹掉已累积的边界)。
+        if step not in _CLEARED_STEPS:
+            _CLEARED_STEPS.add(step)
+            _GLOBAL_SCORE_BOUNDS.clear()
+
     param_group['importance_scores'] = dict()
     with torch.no_grad():
+        # 1. 计算原始重要性分数
         for cri_name in criteria:
             if 'magnitude' == cri_name:
                 importance_score_by_magnitude(param_group)
@@ -18,9 +311,28 @@ def calculate_importance_score(criteria, param_group):
             elif 'taylor_second_order' == cri_name:
                 importance_score_by_second_order_taylor(param_group)
 
-def calculate_importance_score_lora(criteria, param_group, global_params):
+    # 2. 记录原始分数到历史 (用于 MCSS 计算方差) 并绘图
+    _record_and_plot(param_group, step=step)
+
+    # 3. 在线 min-max 归一化 (默认关闭; 开启会与优化器的 Frobenius 归一化叠加)
+    flag = ONLINE_NORMALIZE_DEFAULT if online_normalize is None else online_normalize
+    if flag:
+        _apply_online_normalization(param_group)
+
+    # 4. MCSS 调整由调用方(优化器)显式触发, 避免与 _apply_kappa_wiring 重复调用
+    #    导致 smooth_factor 叠加失真。见 base_hybrid_sparse_optimizer.compute_importance_scores
+
+
+def calculate_importance_score_lora(criteria, param_group, global_params, bit_layers=None, step=None, smooth_factor=0.8):
+    """
+    Args:
+        step (int, optional): 当前训练步数
+        bit_layers: (新增参数) 传入位宽字典
+        smooth_factor (float): 校准因子混合比例，默认 0.8
+    """
     param_group['importance_scores'] = dict()
     with torch.no_grad():
+        # 1. 计算原始重要性分数
         for cri_name in criteria:
             if 'magnitude' in cri_name:
                 importance_score_by_magnitude_lora(param_group)
@@ -32,3 +344,8 @@ def calculate_importance_score_lora(criteria, param_group, global_params):
                 importance_score_by_first_order_taylor_lora(param_group, global_params)
             elif 'taylor_second_order' in cri_name:
                 importance_score_by_second_order_taylor_lora(param_group, global_params)
+
+    # 2. 记录原始分数到历史并绘图
+    _record_and_plot(param_group, step=step)
+
+    # 3. MCSS 调整由调用方(优化器)显式触发, 避免重复调用失真 (见 calculate_importance_score 注释)

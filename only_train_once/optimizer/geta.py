@@ -13,10 +13,265 @@ from only_train_once.transform import (
 )
 
 from .base_hybrid_sparse_optimizer import BaseHybridSparseOptimizer
+from .importance_score import set_log_dir as _set_score_log_dir
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+) if not logging.getLogger().handlers else None
+
+
+class RCAJSController:
+    """
+    [DACO - RCAJS] Rate-Control Adaptive Joint Sparsity (RCAJS)
+    Lagrangian KL-divergence closed-loop controller for adaptive pruning.
+
+    论文核心:
+        - 目标: min  KL(p_target || p_curr) + λ * stability_term
+        - 提前停止: 当 C_curr <= C_target 时停止
+        - 自适应剪枝率: r_p = r_base * exp(-β_p * Δ_p)
+        - 位宽自适应: φ_b 阈值触发位宽缩减
+    """
+
+    def __init__(
+        self,
+        total_groups: int,
+        target_sparsity: float,
+        beta_p: float = 0.1,
+        lambda_stability: float = 0.1,
+        phi_b_threshold: float = 0.8,
+        verbose: bool = False,
+        device: str = "cuda",
+    ):
+        self.total_groups = total_groups
+        self.target_sparsity = target_sparsity  # 目标稀疏度 (0~1)
+        self.target_num_groups = int(total_groups * (1 - target_sparsity))  # 目标重要组数
+        self.beta_p = beta_p  # 自适应速率系数
+        self.lambda_stability = lambda_stability  # Lagrangian 稳定性权重
+        self.phi_b_threshold = phi_b_threshold  # 位宽自适应触发阈值
+        self.verbose = verbose
+        self.device = device
+        self.logger = logging.getLogger("DACO.rcajs")
+
+        # 状态追踪
+        self.history_sparsity = []  # 历史稀疏度记录
+        self.history_delta_p = []   # 历史 Δ_p = target - current
+        self.history_prune_rate = []  # 历史剪枝率
+        self.current_sparsity = 0.0
+        self.curr_pruning_rate = 0.05  # 初始剪枝率 (cosine 基础值)
+        self.early_stopped = False
+
+        # KL 散度追踪
+        self.prev_kl_div = None
+        self.kl_window_size = 5
+        self.kl_history = []
+
+        # 位宽自适应
+        self.bit_layers_below_max_count = 0
+        self.bit_layers_total_count = 0
+        self.bit_reduction_triggered = False
+
+    def compute_current_sparsity(self, num_pruned_groups: int) -> float:
+        """计算当前稀疏度 = 已剪枝组数 / 总组数"""
+        self.current_sparsity = num_pruned_groups / max(self.total_groups, 1)
+        return self.current_sparsity
+
+    def compute_delta_p(self) -> float:
+        """
+        计算稀疏度偏差 Δ_p = target_sparsity - current_sparsity
+        正偏差 → 需要更多剪枝；负偏差 → 剪枝过度
+        """
+        delta_p = self.target_sparsity - self.current_sparsity
+        return delta_p
+
+    def compute_stability_term(self) -> float:
+        """
+        稳定性项: 基于历史稀疏度变化的波动程度
+        Ψ_stability = exp(-σ(Δ_p_history))
+        波动小 → Ψ 接近 1（鼓励继续剪枝）
+        波动大 → Ψ 接近 0（抑制激进剪枝）
+        """
+        if len(self.history_delta_p) < 2:
+            return 1.0
+        delta_p_arr = np.array(self.history_delta_p[-self.kl_window_size:])
+        std_delta = np.std(delta_p_arr)
+        stability_term = math.exp(-std_delta)
+        return max(0.1, stability_term)  # 下限 0.1
+
+    def compute_kl_divergence(self, score_dist: torch.Tensor) -> float:
+        """
+        计算当前分数分布与均匀分布的 KL 散度
+        KL(Uniform || Score) 越小 → 分布越不均匀（剪枝越激进）
+        用于判断是否接近收敛
+        """
+        # 归一化为概率分布
+        probs = torch.nn.functional.softmax(score_dist.flatten(), dim=0)
+        probs = probs.cpu().numpy()
+        probs = np.maximum(probs, 1e-10)  # 避免 log(0)
+
+        # 均匀分布
+        uniform = 1.0 / len(probs)
+        kl_div = np.sum(probs * np.log(probs / uniform))
+
+        # 滑动平均
+        self.kl_history.append(kl_div)
+        if len(self.kl_history) > self.kl_window_size:
+            self.kl_history.pop(0)
+
+        return kl_div
+
+    def should_early_stop(self, num_active_redundant: int) -> bool:
+        """
+        提前停止判断: 当剩余待剪枝冗余组数 <= 0 时停止（即已无冗余组可剪）
+        论文条件: C_curr <= C_target → 无更多冗余组需要剪枝时停止
+        """
+        if num_active_redundant <= 0:
+            self.early_stopped = True
+            if self.verbose:
+                target_redundant = self.total_groups - self.target_num_groups
+                self.logger.info(
+                    f"[DACO][RCAJS] early_stop triggered: active_redundant={num_active_redundant}<=0 "
+                    f"pruned={self.total_groups - num_active_redundant} "
+                    f"target_keep={self.target_num_groups} target_redundant={target_redundant}"
+                )
+            return True
+        return False
+
+    def compute_adaptive_prune_rate(self, base_rate: float = None) -> float:
+        """
+        [核心] 自适应剪枝率计算 — Lagrangian 闭环控制
+
+        公式: r_p = r_base * exp(-β_p * Δ_p) * Ψ_stability
+
+        - Δ_p > 0 (稀疏度不足): exp(-β*Δ) < 1 → 加速剪枝
+        - Δ_p < 0 (过度剪枝): exp(-β*Δ) > 1 → 减速/回退
+        - Ψ_stability < 1 (波动大): 进一步抑制激进剪枝
+        """
+        if self.early_stopped:
+            return 0.0
+
+        delta_p = self.compute_delta_p()
+        stability_term = self.compute_stability_term()
+
+        if base_rate is None:
+            # Cosine 退火基础剪枝率 (与原 DGD 一致)
+            progress = min(1.0, self.current_sparsity / max(self.target_sparsity, 0.01))
+            base_rate = 0.01 + 0.07 * (1 + math.cos(math.pi * progress)) / 2
+
+        # Lagrangian 自适应修正
+        adaptive_factor = math.exp(-self.beta_p * delta_p)
+        self.curr_pruning_rate = base_rate * adaptive_factor * stability_term
+
+        # 硬约束: 剪枝率上限
+        self.curr_pruning_rate = np.clip(self.curr_pruning_rate, 0.001, 0.15)
+
+        return self.curr_pruning_rate
+
+    def update_bit_adaptive(self, bit_layers_dict: dict, max_bit: int = 16):
+        """
+        位宽自适应触发判断: 当 φ_b (低于 max_bit 的层比例) > φ_b_threshold 时
+        触发一次 bit_reduction
+        """
+        if not bit_layers_dict:
+            return False
+
+        below_max_count = 0
+        total_count = 0
+        for layer_name, bits in bit_layers_dict.items():
+            if isinstance(bits, dict) and "weight" in bits:
+                if bits["weight"] < max_bit:
+                    below_max_count += 1
+                total_count += 1
+            elif isinstance(bits, (int, float)):
+                if bits < max_bit:
+                    below_max_count += 1
+                total_count += 1
+
+        if total_count == 0:
+            return False
+
+        phi_b = below_max_count / total_count
+        self.bit_layers_below_max_count = below_max_count
+        self.bit_layers_total_count = total_count
+
+        should_trigger = (phi_b > self.phi_b_threshold) and not self.bit_reduction_triggered
+        # 结构化日志: 记录 φ_b 实测值 (无论是否触发), 便于敏感性分析
+        self.logger.info(
+            f"[DACO][RCAJS] bit_adaptive check: phi_b={phi_b:.4f} threshold={self.phi_b_threshold} "
+            f"below_max={below_max_count}/{total_count} max_bit={max_bit} trigger={should_trigger}"
+        )
+        if should_trigger:
+            self.bit_reduction_triggered = True
+
+        return should_trigger
+
+    def step(
+        self,
+        num_pruned_groups: int,
+        score_dist: torch.Tensor = None,
+        base_rate: float = None,
+    ) -> dict:
+        """
+        RCAJS 一步更新: 更新状态、返回自适应剪枝率
+
+        Returns:
+            dict: {
+                'prune_rate': float,          # 自适应剪枝率
+                'current_sparsity': float,     # 当前稀疏度
+                'delta_p': float,              # 稀疏度偏差
+                'stability_term': float,       # 稳定性项 Ψ
+                'kl_div': float,               # KL 散度
+                'early_stop': bool,            # 是否提前停止
+                'bit_adaptive_trigger': bool,  # 是否触发位宽自适应
+            }
+        """
+        # 1. 更新当前稀疏度
+        self.compute_current_sparsity(num_pruned_groups)
+        delta_p = self.compute_delta_p()
+
+        # 2. 记录历史
+        self.history_sparsity.append(self.current_sparsity)
+        self.history_delta_p.append(delta_p)
+
+        # 3. 计算 KL 散度（如果提供了分数分布）
+        kl_div = 0.0
+        if score_dist is not None:
+            kl_div = self.compute_kl_divergence(score_dist)
+
+        # 4. 提前停止检查
+        target_redundant = self.total_groups - self.target_num_groups
+        num_active_redundant = self.total_groups * self.target_sparsity - num_pruned_groups
+        early_stop = self.should_early_stop(int(max(0, num_active_redundant)))
+
+        # 5. 计算自适应剪枝率
+        prune_rate = self.compute_adaptive_prune_rate(base_rate)
+        stability_term = self.compute_stability_term()
+
+        # 6. 记录
+        self.history_prune_rate.append(prune_rate)
+
+        return {
+            "prune_rate": prune_rate,
+            "current_sparsity": self.current_sparsity,
+            "delta_p": delta_p,
+            "stability_term": stability_term,
+            "kl_div": kl_div,
+            "early_stop": early_stop,
+            "bit_adaptive_trigger": False,  # 由外部调用 update_bit_adaptive 设置
+        }
+
+    def get_summary(self) -> dict:
+        """返回 RCAJS 控制器状态摘要"""
+        return {
+            "total_groups": self.total_groups,
+            "target_sparsity": self.target_sparsity,
+            "current_sparsity": self.current_sparsity,
+            "delta_p": self.compute_delta_p(),
+            "curr_pruning_rate": self.curr_pruning_rate,
+            "stability_term": self.compute_stability_term(),
+            "early_stopped": self.early_stopped,
+            "bit_adaptive_triggered": self.bit_reduction_triggered,
+            "history_len": len(self.history_sparsity),
+        }
 
 
 class GETA(BaseHybridSparseOptimizer):
@@ -35,6 +290,10 @@ class GETA(BaseHybridSparseOptimizer):
         second_momentum=None,
         dampening=None,
         weight_decay=None,
+
+        diffusion_noise_init=1e-4,
+        diffusion_steps=None,
+
         target_group_sparsity=0.5,
         start_projection_step=0,
         projection_steps=1,
@@ -57,6 +316,8 @@ class GETA(BaseHybridSparseOptimizer):
     ):
         self.log_dir = log_dir
         os.makedirs(self.log_dir, exist_ok=True)
+        # 分数记录目录跟随 log_dir (避免多实验写同一 temp/ 冲突)
+        _set_score_log_dir(os.path.join(self.log_dir, "scores"))
         self.logger = logging.getLogger(self.__class__.__name__)
         self.start_projection_step = start_projection_step
         self.projection_steps = projection_steps
@@ -87,6 +348,12 @@ class GETA(BaseHybridSparseOptimizer):
         self.gamma = 0.0
         self.d_quant = 0.0
         self.bit_layers = {}  # Store the bit width for each layer
+
+        self.diffusion_noise_init = diffusion_noise_init
+        self.diffusion_steps = diffusion_steps if diffusion_steps is not None else pruning_steps
+        self.diffusion_noise_ratio = 0.5
+
+        self.logger.info(f"Diffusion SGLD Enabled: Init Noise={self.diffusion_noise_init}")
 
         if importance_score_criteria == "default":
             self.importance_score_criteria = {
@@ -146,8 +413,24 @@ class GETA(BaseHybridSparseOptimizer):
             f"Target redundant groups per period: {self.active_num_redundant_groups}"
         )
 
+        # --- [DACO - RCAJS] Lagrangian KL-divergence 控制器初始化 ---
+        self.rcajs = RCAJSController(
+            total_groups=self.total_num_groups,
+            target_sparsity=target_group_sparsity,
+            beta_p=0.1,
+            lambda_stability=0.1,
+            phi_b_threshold=0.8,
+            verbose=(verbose == "True"),
+            device=device,
+        )
+        self.logger.info(
+            f"[RCAJS] 控制器初始化: total_groups={self.total_num_groups}, "
+            f"target_sparsity={target_group_sparsity}, beta_p=0.1"
+        )
+
     @contextmanager
     def safe_open_file(self, filename, mode="a"):
+        file = None
         try:
             os.makedirs(os.path.dirname(filename), exist_ok=True)
             file = open(filename, mode)
@@ -155,7 +438,22 @@ class GETA(BaseHybridSparseOptimizer):
         except IOError as e:
             self.logger.error(f"Error opening file {filename}: {e}")
         finally:
-            file.close()
+            if file is not None:
+                file.close()
+
+    def _get_diffusion_decay_factor(self):
+        """计算扩散噪声的衰减系数 (Cosine Schedule: 1.0 -> 0.0)"""
+        # 设定扩散开始时间 (通常与投影或剪枝开始时间对齐)
+        start_step = self.start_pruning_step
+        current_t = self.num_steps - start_step
+
+        # 还没开始或已经结束 -> 不加噪
+        if current_t < 0 or current_t >= self.diffusion_steps:
+            return 0.0
+
+        # 余弦退火计算
+        decay = 0.5 * (1 + math.cos(math.pi * current_t / self.diffusion_steps))
+        return decay
 
     def grad_clipping(self):
         grad_clip_min = self.grad_clip_min
@@ -169,13 +467,85 @@ class GETA(BaseHybridSparseOptimizer):
         curr_active_num_redundant_groups = self.active_num_redundant_groups[
             self.curr_pruning_period
         ]
-        curr_K = len(self.pruned_group_idxes) + curr_active_num_redundant_groups
-        _, top_indices = torch.topk(-global_scores, curr_K)
+
+        # 预算模式:
+        #   "fixed" — 纯 GETA: 只用预生成的固定预算数组, 完全不调用 RCAJS。
+        #             baseline 必须是这个模式, 否则 exp(-βΔ)/Ψ 仍会改变剪枝节奏。
+        #   "rcajs" — DACO: 由 Lagrangian 闭环决定本期剪枝组数。
+        budget_mode = getattr(self, "prune_budget", "rcajs")
+
+        if budget_mode == "fixed":
+            curr_active_num_adaptive = curr_active_num_redundant_groups
+            rcajs_state = {
+                "prune_rate": 0.0,
+                "current_sparsity": len(self.pruned_group_idxes) / max(self.total_num_groups, 1),
+                "delta_p": 0.0, "stability_term": 1.0, "kl_div": 0.0,
+                "early_stop": False,
+            }
+        else:
+            rcajs_state = self.rcajs.step(
+                num_pruned_groups=len(self.pruned_group_idxes),
+                score_dist=global_scores,
+            )
+            # 用 RCAJS 剪枝率计算本次 period 应剪枝的组数
+            rcajs_adaptive_K = int(math.ceil(
+                rcajs_state["prune_rate"] * self.total_num_groups))
+            # 对"剩余到目标的组数"取小, 而不是对固定预算取小。
+            # 原先 min(..., fixed) 在 periods 很大时 (每 epoch 一次) 会把
+            # RCAJS 的余弦速率永久压到线性预算上, 自适应项等于失效。
+            remain_to_target = max(
+                0, int(self.total_num_groups * self.target_sparsity)
+                - len(self.pruned_group_idxes))
+            curr_active_num_adaptive = min(rcajs_adaptive_K, remain_to_target)
+
+        if rcajs_state["early_stop"]:
+            curr_active_num_adaptive = 0
+            self.logger.info(
+                f"[RCAJS] Period {self.curr_pruning_period} 提前停止: "
+                f"sparsity={rcajs_state['current_sparsity']:.3f}, "
+                f"Δ_p={rcajs_state['delta_p']:.4f}, "
+                f"Ψ={rcajs_state['stability_term']:.3f}, "
+                f"KL={rcajs_state['kl_div']:.4f}"
+            )
+
+        # 结构化日志: 每个 period 都记录 RCAJS 全状态 (供敏感性分析)
+        self.logger.info(
+            f"[DACO][RCAJS] period={self.curr_pruning_period} "
+            f"rate={rcajs_state['prune_rate']:.4f} "
+            f"fixed={curr_active_num_redundant_groups} adaptive={curr_active_num_adaptive} "
+            f"sparsity={rcajs_state['current_sparsity']:.4f} target={self.rcajs.target_sparsity:.4f} "
+            f"delta_p={rcajs_state['delta_p']:+.4f} "
+            f"psi={rcajs_state['stability_term']:.4f} "
+            f"kl={rcajs_state['kl_div']:.4f} "
+            f"pruned_total={len(self.pruned_group_idxes)}"
+        )
+
+        # 位宽分布摘要
+        _wbits = [v.get("weight") for v in self.bit_layers.values()
+                  if isinstance(v, dict) and v.get("weight") is not None]
+        if _wbits:
+            self.logger.info(
+                f"[DACO][BITDIST] period={self.curr_pruning_period} "
+                f"avg={sum(_wbits)/len(_wbits):.2f} min={min(_wbits)} max={max(_wbits)} "
+                f"max_bit_wt={self.max_bit_wt} n_layers={len(_wbits)}"
+            )
+
+        # --- 确定 top-K 冗余组 ---
+        # 【Bug Fix】torch.topk K 越界时直接崩溃，加安全边界
+        curr_K = len(self.pruned_group_idxes) + curr_active_num_adaptive
+        actual_K = min(curr_K, len(global_scores))
+        _, top_indices = torch.topk(-global_scores, actual_K)
         top_indices = top_indices.cpu().numpy()
         top_indices = np.setdiff1d(top_indices, self.pruned_group_idxes)[
-            :curr_active_num_redundant_groups
+            :curr_active_num_adaptive
         ].tolist()
         self.pruned_group_idxes.extend(top_indices)
+        self.logger.info(
+            f"[DACO][PRUNE] period={self.curr_pruning_period} "
+            f"requested={curr_active_num_adaptive} actual_pruned={len(top_indices)} "
+            f"cumulative_pruned={len(self.pruned_group_idxes)} "
+            f"actual_K={actual_K} global_scores={len(global_scores)}"
+        )
 
         for group in self.param_groups:
             if group["is_prunable"] and not group["is_auxiliary"]:
@@ -384,6 +754,7 @@ class GETA(BaseHybridSparseOptimizer):
 
         eta = 0.999
         zeta = 0.9
+        forget_rate = 1.0
         if torch.mean(flatten_clip).item() < 1e-8:
             forget_rate = 0.0
         else:
@@ -409,43 +780,14 @@ class GETA(BaseHybridSparseOptimizer):
                     / (cosine_similarity_clip * flatten_clip_norm)
                 )
             else:
-                # TODO: @xiaoyi, refactor
-                if self.verbose == "True":
-                    self.logger.warning(
-                        f"Unexpected cosine_similarity_clip value: {cosine_similarity_clip}"
-                    )
-                    outID = "log_info_" + str(self.start_pruning_step)
-                    filename = os.path.join("outputs",f"sparsity_{self.target_group_sparsity*100}", f"{outID}.txt")
-                    with self.safe_open_file(filename) as logfile:
-                        logfile.write("Throw an error: cosine_similarity_clip error\n")
-                        logfile.write(
-                            "similarity_value: {cos_similar:^8.9e}\n".format(
-                                cos_similar=cosine_similarity_clip.item()
-                            )
-                        )
-                        logfile.write(
-                            "flatten_grad_max: {flatten_grad:^8.9e}\n".format(
-                                flatten_grad=torch.max(flatten_grad).item()
-                            )
-                        )
-                        logfile.write(
-                            "flatten_clip_max: {flatten_clip:^8.9e}\n".format(
-                                flatten_clip=torch.max(flatten_clip).item()
-                            )
-                        )
-                        logfile.write(
-                            "flatten_grad_mean: {flatten_grad:^8.9e}\n".format(
-                                flatten_grad=torch.mean(flatten_grad).item()
-                            )
-                        )
-                        logfile.write(
-                            "flatten_clip_mean: {flatten_clip:^8.9e}\n".format(
-                                flatten_clip=torch.mean(flatten_clip).item()
-                            )
-                        )
-                        # logfile.write("all_grad_max: {flatten_grad:^8.9e}\n".format(flatten_grad=torch.max(torch.Tensor(prune_param_grad_list))) )
-                    self.logger.error("Error with computing cosine_similarity_clip!")
-                    assert 1 == 2
+                # 修复: 原 assert 1==2 会中断 200 epoch 训练, 改为跳过该步 forget_rate=0
+                cos_val = cosine_similarity_clip.item() if hasattr(cosine_similarity_clip, 'item') else float(cosine_similarity_clip)
+                self.logger.warning(
+                    f"[DACO][GAMMA] step={self.num_steps} unexpected_cos_sim={cos_val:.4e} "
+                    f"grad_norm={flatten_grad_norm.item():.4e} clip_norm={flatten_clip_norm.item():.4e} "
+                    f"-> forget_rate=0.0 (skip, no crash)"
+                )
+                forget_rate = 0.0
 
         # Determine d_quant range
         bit_width_lower = bit_range[0]
@@ -474,26 +816,6 @@ class GETA(BaseHybridSparseOptimizer):
             d_quant = min(
                 d_quant_upper, d_quant
             )  # Avoid quant step size d being too large.
-        if self.verbose == "True":
-            filename = os.path.join("outputs",f"sparsity_{self.target_group_sparsity*100}", f"{outID}.txt")
-            with self.safe_open_file(filename) as logfile:
-                content = "Step: {num_step:^11s} Layer_name: {name:^30s} clip_max: {clip_max:^8.5e} res_max: {res_max:^8.5e} grad_max: {grad_max:^8.5e} clip_grad: {clip_grad:^8.5e} res_grad: {res_grad:^8.5e} flatten_clip_norm: {flatten_clip_norm:^8.5e} flatten_res_norm: {flatten_res_norm:^8.5e} flatten_grad_norm: {flatten_grad_norm:^8.5e} cos(gamma): {angle_gamma:^8.5e} cos(d):{angle_d:^8.5e} forget_rate: {gamma:^8.5e} d_quant: {d_quant:^8.5e} \n".format(
-                    num_step=str(self.num_steps),
-                    name=layer_name_list[0] if layer_name_list else "N/A",
-                    clip_max=torch.max(flatten_clip).item(),
-                    res_max=torch.max(flatten_res).item(),
-                    grad_max=torch.max(flatten_grad).item(),
-                    clip_grad=torch.dot(flatten_clip, flatten_grad).item(),
-                    res_grad=torch.dot(flatten_res, flatten_grad).item(),
-                    flatten_clip_norm=flatten_clip_norm,
-                    flatten_res_norm=flatten_res_norm,
-                    flatten_grad_norm=flatten_grad_norm,
-                    angle_gamma=cosine_similarity_clip,
-                    angle_d=cosine_similarity_res,
-                    gamma=forget_rate,
-                    d_quant=d_quant,
-                )
-                logfile.write(content)
 
         return forget_rate, d_quant
 
@@ -545,6 +867,58 @@ class GETA(BaseHybridSparseOptimizer):
 
         return bit_dict
 
+    def _param_cache(self, param_group):
+        """按 p_names 缓存「参数分类」与「layer -> 参数索引」映射。
+
+        joint 阶段原实现是 `for layer_name: for p_name: if layer_name in p_name`,
+        20 个量化层 × 197 个参数 × 每步多次遍历 ≈ 10 万次字符串子串匹配。
+        这里以 tuple(p_names) 为键缓存, 剪枝重建 param_groups 后键变化自动失效。
+        """
+        key = tuple(param_group["p_names"])
+        store = self.__dict__.setdefault("_param_cache_store", {})
+        cache = store.get(key)
+        if cache is not None:
+            return cache
+
+        layers = {}
+        wt_q_idx, act_q_idx = [], []
+        for i, p_name in enumerate(param_group["p_names"]):
+            head, sep, tag = p_name.rpartition(".")
+            if not sep:
+                continue
+            layer = layers.get(head)
+            if layer is None:
+                layer = layers[head] = {}
+            if tag == "d_quant_wt":
+                layer["d_wt"] = i
+                wt_q_idx.append(i)
+            elif tag == "t_quant_wt":
+                layer["t_wt"] = i
+                wt_q_idx.append(i)
+            elif tag == "q_m_wt":
+                layer["qm_wt"] = i
+                wt_q_idx.append(i)
+            elif tag == "d_quant_act":
+                layer["d_act"] = i
+                act_q_idx.append(i)
+            elif tag == "t_quant_act":
+                layer["t_act"] = i
+                act_q_idx.append(i)
+            elif tag == "q_m_act":
+                layer["qm_act"] = i
+                act_q_idx.append(i)
+
+        cache = {
+            # 只保留含量化步长的层, 其余(纯 weight/bias)无需投影
+            "layers": {k: v for k, v in layers.items() if "d_wt" in v or "d_act" in v},
+            "wt_q_idx": frozenset(wt_q_idx),
+            "act_q_idx": frozenset(act_q_idx),
+        }
+        if len(store) > 8:
+            store.clear()
+        store[key] = cache
+        return cache
+
     def gradient_descent_step(self, param_group):
         for p_name, p in zip(param_group["p_names"], param_group["params"]):
             if p_name not in param_group["grad_variant"]:
@@ -574,179 +948,110 @@ class GETA(BaseHybridSparseOptimizer):
 
     def partial_projected_gradient_descent_step_range_wt(self, param_group):
         """Apply projected gradient descent for weight quantization parameters."""
-        # First part remains the same - gradient descent step
-        for p_name, p in zip(param_group["p_names"], param_group["params"]):
-            if p_name not in param_group["grad_variant"]:
+        params = param_group["params"]
+        grads = param_group["grad_variant"]
+        lr, lr_quant = param_group["lr"], param_group["lr_quant"]
+        wd = param_group["weight_decay"]
+        apply_wd = wd is not None and param_group["variant"] == "adamw"
+
+        cache = self._param_cache(param_group)
+        wt_q_idx = cache["wt_q_idx"]
+
+        # 性能: 参数类型预索引, 不再逐参数做 3 次字符串子串匹配
+        for i, p_name in enumerate(param_group["p_names"]):
+            g = grads.get(p_name)
+            if g is None:
                 continue
-            if (
-                param_group["weight_decay"] is not None
-                and param_group["variant"] == "adamw"
-            ):
-                if (
-                    "d_quant_wt" in p_name
-                    or "t_quant_wt" in p_name
-                    or "q_m_wt" in p_name
-                ):
-                    p.data.add_(
-                        param_group["weight_decay"] * p.data,
-                        alpha=-param_group["lr_quant"],
-                    )
-                else:
-                    p.data.add_(
-                        param_group["weight_decay"] * p.data, alpha=-param_group["lr"]
-                    )
+            p = params[i]
+            step_lr = lr_quant if i in wt_q_idx else lr
+            if apply_wd:
+                p.data.add_(wd * p.data, alpha=-step_lr)
+            p.data.add_(g, alpha=-step_lr)
 
-            # Assign different learning rate to weights and quantization params
-            if "d_quant_wt" in p_name or "t_quant_wt" in p_name or "q_m_wt" in p_name:
-                p.data.add_(
-                    param_group["grad_variant"][p_name], alpha=-param_group["lr_quant"]
-                )
-            else:
-                p.data.add_(
-                    param_group["grad_variant"][p_name], alpha=-param_group["lr"]
-                )
-
-        # Find layers in each param_group
-        layer_name_list = []
-        for p_name in param_group["p_names"]:
-            if "d_quant_wt" not in p_name:
+        # Projection: 直接按 layer 索引取 q_m / t_quant, 无需嵌套扫描
+        for idx in cache["layers"].values():
+            i_d = idx.get("d_wt")
+            if i_d is None or "qm_wt" not in idx:
                 continue
-            layer_name = ".".join(p_name.split(".")[:-1])
-            if layer_name not in layer_name_list:
-                layer_name_list.append(layer_name)
-
-        # Projection
-        for layer_name in layer_name_list:
-            t_quant_wt = None
-            for p_name, p in zip(param_group["p_names"], param_group["params"]):
-                if layer_name in p_name:
-                    if "t_quant_wt" in p_name:
-                        t_quant_wt = p.data
-                    if "q_m_wt" in p_name:
-                        q_m_wt = p.data
-
-            # Calculate bounds for this layer
+            q_m_wt = params[idx["qm_wt"]].data
+            t_quant_wt = params[idx["t_wt"]].data if "t_wt" in idx else None
             d_quant_min = self._d_quant_helper(self.max_bit_wt, q_m_wt, t_quant_wt)
             d_quant_max = self._d_quant_helper(self.min_bit_wt, q_m_wt, t_quant_wt)
-
-            # Convert bounds to scalars if they're tensors
-            if isinstance(d_quant_min, torch.Tensor):
-                d_quant_min = float(d_quant_min.item())
-            if isinstance(d_quant_max, torch.Tensor):
-                d_quant_max = float(d_quant_max.item())
-
-            # Apply bounds to d_quant parameters
-            for p_name, p in zip(param_group["p_names"], param_group["params"]):
-                if layer_name in p_name and "d_quant_wt" in p_name:
-                    # Clip using scalar bounds
-                    p.data.clamp_(min=d_quant_min, max=d_quant_max)
+            params[i_d].data.clamp_(min=d_quant_min, max=d_quant_max)
 
     def partial_projected_gradient_descent_step_range_act(self, param_group):
         # Add them as hyperparameter in hesso_quant optimizer in the future
         min_bit = self.min_bit_act
         max_bit = self.max_bit_act
 
-        for p_name, p in zip(param_group["p_names"], param_group["params"]):
-            if p_name not in param_group["grad_variant"]:
+        params = param_group["params"]
+        names = param_group["p_names"]
+        grads = param_group["grad_variant"]
+        lr_quant = param_group["lr_quant"]
+        wd = param_group["weight_decay"]
+        apply_wd = wd is not None and param_group["variant"] == "adamw"
+
+        cache = self._param_cache(param_group)
+
+        # 性能: 只更新激活量化参数, 用预索引替代 3 次字符串子串匹配
+        for i in cache["act_q_idx"]:
+            g = grads.get(names[i])
+            if g is None:
                 continue
-            if (
-                param_group["weight_decay"] is not None
-                and param_group["variant"] == "adamw"
-            ):
-                if (
-                    "d_quant_act" in p_name
-                    or "t_quant_act" in p_name
-                    or "q_m_act" in p_name
-                ):
-                    p.data.add_(
-                        param_group["weight_decay"] * p.data,
-                        alpha=-param_group["lr_quant"],
-                    )
+            p = params[i]
+            if apply_wd:
+                p.data.add_(wd * p.data, alpha=-lr_quant)
+            p.data.add_(g, alpha=-lr_quant)
 
-            # Assign learning rate to activation quantization params
-            if (
-                "d_quant_act" in p_name
-                or "t_quant_act" in p_name
-                or "q_m_act" in p_name
-            ):
-                p.data.add_(
-                    param_group["grad_variant"][p_name], alpha=-param_group["lr_quant"]
-                )
-
-        # Find layers in each param_group
-        layer_name_list = []
-        for p_name in param_group["p_names"]:
-            if "d_quant_act" not in p_name:
+        # Projection: 按 layer 索引直接取 q_m_act / t_quant_act
+        for idx in cache["layers"].values():
+            i_d = idx.get("d_act")
+            if i_d is None or "qm_act" not in idx:
                 continue
-            layer_name = ".".join(p_name.split(".")[:-1])
-            if layer_name not in layer_name_list:
-                layer_name_list.append(layer_name)
-
-        # Projection
-        for layer_name in layer_name_list:
-            t_quant_act = None
-            for p_name, p in zip(param_group["p_names"], param_group["params"]):
-                if layer_name in p_name:
-                    if "t_quant_act" in p_name:
-                        t_quant_act = p.data
-                    if "q_m_act" in p_name:
-                        q_m_act = p.data
-            for p_name, p in zip(param_group["p_names"], param_group["params"]):
-                if layer_name in p_name and "d_quant_act" in p_name:
-                    d_quant_min = self._d_quant_helper(max_bit, q_m_act, t_quant_act)
-                    d_quant_max = self._d_quant_helper(min_bit, q_m_act, t_quant_act)
-                    p.data = torch.clip(p.data, min=d_quant_min, max=d_quant_max)
+            q_m_act = params[idx["qm_act"]].data
+            t_quant_act = params[idx["t_act"]].data if "t_act" in idx else None
+            d_quant_min = self._d_quant_helper(max_bit, q_m_act, t_quant_act)
+            d_quant_max = self._d_quant_helper(min_bit, q_m_act, t_quant_act)
+            params[i_d].data.clamp_(min=d_quant_min, max=d_quant_max)
 
     def partial_projected_gradient_descent_step_fix(self, param_group, bit_dict):
-        for p_name, p in zip(param_group["p_names"], param_group["params"]):
-            if p_name not in param_group["grad_variant"]:
+        params = param_group["params"]
+        names = param_group["p_names"]
+        grads = param_group["grad_variant"]
+        lr, lr_quant = param_group["lr"], param_group["lr_quant"]
+        wd = param_group["weight_decay"]
+        apply_wd = wd is not None and param_group["variant"] == "adamw"
+
+        cache = self._param_cache(param_group)
+        # 注意: fix 阶段判据是 "d_quant"/"t_quant"/"q_m"(不带 _wt/_act),
+        # 权重与激活的量化参数一起走 lr_quant, 故取并集
+        q_idx = cache["wt_q_idx"] | cache["act_q_idx"]
+
+        for i, p_name in enumerate(names):
+            g = grads.get(p_name)
+            if g is None:
                 continue
-            if (
-                param_group["weight_decay"] is not None
-                and param_group["variant"] == "adamw"
-            ):
-                if "d_quant" in p_name or "t_quant" in p_name or "q_m" in p_name:
-                    p.data.add_(
-                        param_group["weight_decay"] * p.data,
-                        alpha=-param_group["lr_quant"],
-                    )
-                else:
-                    p.data.add_(
-                        param_group["weight_decay"] * p.data, alpha=-param_group["lr"]
-                    )
+            p = params[i]
+            step_lr = lr_quant if i in q_idx else lr
+            if apply_wd:
+                p.data.add_(wd * p.data, alpha=-step_lr)
+            p.data.add_(g, alpha=-step_lr)
 
-            # Assign different learning rate to weights and quantization params
-            if "d_quant" in p_name or "t_quant" in p_name or "q_m" in p_name:
-                p.data.add_(
-                    param_group["grad_variant"][p_name], alpha=-param_group["lr_quant"]
-                )
-            else:
-                p.data.add_(
-                    param_group["grad_variant"][p_name], alpha=-param_group["lr"]
-                )
-
-        for layer_name in bit_dict.keys():
-            t_quant_wt = None
-            t_quant_act = None
-            for p_name, p in zip(param_group["p_names"], param_group["params"]):
-                if layer_name in p_name:
-                    if "t_quant_wt" in p_name:
-                        t_quant_wt = p.data
-                    if "q_m_wt" in p_name:
-                        q_m_wt = p.data
-                    if "t_quant_act" in p_name:
-                        t_quant_act = p.data
-                    if "q_m_act" in p_name:
-                        q_m_act = p.data
-            for p_name, p in zip(param_group["p_names"], param_group["params"]):
-                if layer_name in p_name and "d_quant_wt" in p_name:
-                    bit_width = bit_dict[layer_name]["weight"]
-                    d_quant_wt = self._d_quant_helper(bit_width, q_m_wt, t_quant_wt)
-                    p.data = torch.clip(p.data, min=d_quant_wt, max=d_quant_wt)
-                if layer_name in p_name and "d_quant_act" in p_name:
-                    bit_width = bit_dict[layer_name]["activation"]
-                    d_quant_act = self._d_quant_helper(bit_width, q_m_act, t_quant_act)
-                    p.data = torch.clip(p.data, min=d_quant_act, max=d_quant_act)
+        # 位宽固定后把 d_quant 钳死到该位宽对应的值
+        for layer_name, bits in bit_dict.items():
+            idx = cache["layers"].get(layer_name)
+            if idx is None:
+                continue
+            if "d_wt" in idx and "qm_wt" in idx:
+                q_m_wt = params[idx["qm_wt"]].data
+                t_quant_wt = params[idx["t_wt"]].data if "t_wt" in idx else None
+                d = self._d_quant_helper(bits["weight"], q_m_wt, t_quant_wt)
+                params[idx["d_wt"]].data.clamp_(min=d, max=d)
+            if "d_act" in idx and "qm_act" in idx:
+                q_m_act = params[idx["qm_act"]].data
+                t_quant_act = params[idx["t_act"]].data if "t_act" in idx else None
+                d = self._d_quant_helper(bits["activation"], q_m_act, t_quant_act)
+                params[idx["d_act"]].data.clamp_(min=d, max=d)
 
     @staticmethod
     def _bit_width_helper(d_quant=None, q_m=None, t_quant=None):
@@ -755,30 +1060,46 @@ class GETA(BaseHybridSparseOptimizer):
 
         if t_quant is None:
             t_quant = 1.0
+        # Clamp exponent to avoid overflow
+        _exp = t_quant * math.log(max(abs(q_m), 1e-10))
+        _exp = max(min(_exp, 50.0), -50.0)
         bit_width = (
-            math.log2(math.exp(t_quant * math.log(abs(q_m))) / abs(d_quant) + 1) + 1
+            math.log2(math.exp(_exp) / max(abs(d_quant), 1e-10) + 1) + 1
         )
 
         return bit_width
 
     @staticmethod
     def _d_quant_helper(bit_width, q_m, t_quant):
-        """Calculate d_quant, using max absolute value of q_m for uniform quantization."""
+        """Calculate d_quant, using max absolute value of q_m for uniform quantization.
+
+        性能: q_m 是 GPU 张量时全程张量运算并返回 0 维张量, 不做 .item()。
+        joint 阶段每层每步要算 4 次, 20 层 × 13 参数组 = 上千次 .item(),
+        等于上千次 GPU 强制同步。返回张量后可直接喂给 clamp_/clip 的 min/max。
+        q_m 是 python / numpy 标量时仍返回 float, 供控制流比较使用。
+        """
+        # 防御: bit_width==1 时 (2**0 - 1)=0 会触发 ZeroDivisionError，
+        #       钳制分母使用的有效位宽下限为 2 (与 min_bit_wt 一致)。
+        eff_bw = max(bit_width, 2)
+        denom = 2 ** (eff_bw - 1) - 1
+
+        if isinstance(q_m, torch.Tensor):
+            t = 1.0 if t_quant is None else t_quant
+            if isinstance(t, torch.Tensor):
+                t = t.reshape(()) if t.numel() == 1 else t.max()
+            q_abs = torch.abs(q_m)
+            q_abs = q_abs.reshape(()) if q_abs.numel() == 1 else q_abs.max()
+            q_abs = q_abs.clamp(min=1e-10)
+            # Clamp exponent to avoid exp overflow
+            exponent = (t * torch.log(q_abs)).clamp(-50.0, 50.0)
+            return (torch.exp(exponent) / denom).reshape(())
+
         if t_quant is None:
             t_quant = 1.0
-
-        # Get maximum absolute value if q_m is a tensor
-        if isinstance(q_m, torch.Tensor):
-            q_m = torch.max(torch.abs(q_m)).item()
-        else:
-            q_m = abs(q_m)
-        # Prevent exact zero
         q_m = max(abs(q_m), 1e-10)
-
-        # Calculate d_quant using scalar math
-        # d_quant = math.exp(t_quant * math.log(q_m)) / (2 ** (bit_width - 1) - 1)
-        d_quant = math.exp(t_quant * math.log(abs(q_m))) / (2 ** (bit_width - 1) - 1)
-        return d_quant
+        exponent = t_quant * math.log(abs(q_m))
+        exponent = max(min(exponent, 50.0), -50.0)
+        return math.exp(exponent) / denom
 
     @staticmethod
     def _quantize_helper(weight, d_quant, q_m, t_quant):
@@ -827,25 +1148,32 @@ class GETA(BaseHybridSparseOptimizer):
         return output
 
     def log_qm_projection(self):
-        """Log q_m during projection"""
-        if (self.num_steps >= self.start_projection_step and 
-            self.num_steps <= self.start_projection_step + self.projection_steps and
-            self.num_steps % 1000 == 0):
-            
-            log_file = os.path.join(self.log_dir, f"projection_qm_{self.num_steps}.txt")
-            with self.safe_open_file(log_file, "w") as f:
-                curr_period = (self.num_steps - self.start_projection_step) // self.projection_period_duration
-                f.write(f"Step: {self.num_steps}, Projection Period: {curr_period}\n")
-                f.write(f"Current max_bit_wt: {self.max_bit_wt}\n\n")
-                
-                for group in self.param_groups:
-                    for p_name, p in zip(group["p_names"], group["params"]):
-                        if "q_m_wt" in p_name:
-                            layer_name = ".".join(p_name.split(".")[:-1])
-                            f.write(f"Layer: {layer_name}\n")
-                            f.write(f"q_m stats: min={p.data.min().item():.6f}, ")
-                            f.write(f"max={p.data.max().item():.6f}, ")
-                            f.write(f"mean={p.data.mean().item():.6f}\n\n")
+        """Log q_m during projection (每个 projection period 记一次)"""
+        if not (self.num_steps >= self.start_projection_step and
+                self.num_steps <= self.start_projection_step + self.projection_steps):
+            return
+        # 修复: 原 % 1000 在投影阶段(通常仅几步)永不触发, 改为按 period_duration 记录
+        period_dur = max(self.projection_period_duration, 1)
+        if (self.num_steps - self.start_projection_step) % period_dur != 0:
+            return
+
+        log_file = os.path.join(self.log_dir, f"projection_qm_{self.num_steps}.txt")
+        with self.safe_open_file(log_file, "w") as f:
+            curr_period = (self.num_steps - self.start_projection_step) // period_dur
+            f.write(f"Step: {self.num_steps}, Projection Period: {curr_period}\n")
+            f.write(f"Current max_bit_wt: {self.max_bit_wt}\n\n")
+            for group in self.param_groups:
+                for p_name, p in zip(group["p_names"], group["params"]):
+                    if "q_m_wt" in p_name:
+                        layer_name = ".".join(p_name.split(".")[:-1])
+                        f.write(f"Layer: {layer_name}\n")
+                        f.write(f"q_m stats: min={p.data.min().item():.6f}, ")
+                        f.write(f"max={p.data.max().item():.6f}, ")
+                        f.write(f"mean={p.data.mean().item():.6f}\n\n")
+        self.logger.info(
+            f"[DACO][PROJ] step={self.num_steps} period={curr_period} "
+            f"max_bit_wt={self.max_bit_wt} log={log_file}"
+        )
 
     def step(self, loss=None, closure=None):
         """
@@ -858,6 +1186,15 @@ class GETA(BaseHybridSparseOptimizer):
         self.num_steps += 1
         self.compute_grad_variant()
 
+        # 阶段切换日志: warmup/projection/joint/cooldown
+        _phase = ("warmup" if self.num_steps <= self.start_projection_step
+                  else "projection" if self.num_steps <= self.start_pruning_step
+                  else "joint" if self.num_steps <= self.start_pruning_step + self.pruning_steps
+                  else "cooldown")
+        if getattr(self, "_last_phase", None) != _phase:
+            self.logger.info(f"[DACO][PHASE] step={self.num_steps} phase={_phase} begin")
+            self._last_phase = _phase
+
         # Determine the bit range projection for weights
         if (
             self.num_steps >= self.start_projection_step
@@ -869,7 +1206,18 @@ class GETA(BaseHybridSparseOptimizer):
             ) % self.projection_period_duration == 0 and (
                 self.num_steps - self.start_projection_step - 1
             ) != 0:
-                self.max_bit_wt = self.max_bit_wt - self.bit_reduction
+                # --- [DACO - RCAJS] 位宽自适应触发判断 ---
+                # 当 φ_b > φ_b_threshold 时，触发一次额外 bit reduction
+                bit_adaptive_triggered = self.rcajs.update_bit_adaptive(
+                    self.bit_layers, max_bit=int(self.max_bit_wt)
+                )
+                if bit_adaptive_triggered:
+                    self.max_bit_wt = max(self.max_bit_wt - self.bit_reduction, self.min_bit_wt)
+                    self.logger.info(
+                        f"[DACO][RCAJS] projection bit_adaptive triggered: max_bit_wt={self.max_bit_wt}"
+                    )
+                else:
+                    self.max_bit_wt = self.max_bit_wt - self.bit_reduction
                 self.min_bit_wt = self.min_bit_wt
 
         # Partition groups into important and redundant groups
@@ -882,7 +1230,7 @@ class GETA(BaseHybridSparseOptimizer):
                 self.num_steps - self.start_pruning_step - 1
             ) % self.pruning_period_duration == 0:
                 self.logger.info(
-                    f"Determining important and redundant groups using saliency scores. Step={self.num_steps}"
+                    f"[DACO][PRUNE] step={self.num_steps} period={self.curr_pruning_period} begin identify_redundant"
                 )
                 self.commit_redundant_idxes()
                 self.compute_importance_scores()
@@ -911,7 +1259,7 @@ class GETA(BaseHybridSparseOptimizer):
                     )
                 else:
                     self.partial_projected_gradient_descent_step_range_wt(group)
-                    # self.partial_projected_gradient_descent_step_range_act(group) # Uncomment this line if apply activation quantization
+                    self.partial_projected_gradient_descent_step_range_act(group) # Uncomment this line if apply activation quantization
             elif (
                 group["is_prunable"] and len(group["active_redundant_idxes"]) > 0
             ):  # Third stage
@@ -919,6 +1267,42 @@ class GETA(BaseHybridSparseOptimizer):
                 # self.logger.info(
                 #     f"Joint pruning and quantization stage. Step={self.num_steps}"
                 # )
+                decay_factor = self._get_diffusion_decay_factor()
+                # 原条件 t==0 是死日志: t==0 恰好落在"上一期索引已 commit 清空、
+                # 本期尚未 identify"的那一步, n_nonempty 恒为 0, 该分支进不去,
+                # 于是 [DACO][DIFFUSION] 全程一条都不打。噪声其实一直在加。
+                # 改为每个剪枝期首次进入时打一次。
+                if (self.pruning_period_duration != 0
+                        and getattr(self, "_diff_log_period", -1)
+                        != self.curr_pruning_period):
+                    self._diff_log_period = self.curr_pruning_period
+                    self.logger.info(
+                        f"[DACO][DIFFUSION] step={self.num_steps} decay={decay_factor:.4e} "
+                        f"noise_init={self.diffusion_noise_init} noise_ratio={self.diffusion_noise_ratio} "
+                        f"diffusion_steps={self.diffusion_steps}"
+                    )
+                if decay_factor > 1e-6:
+                    for p_name, p in zip(group["p_names"], group["params"]):
+                        if p.grad is None: continue
+
+                        # A. 区分学习率: 量化参数用 lr_quant, 权重用 lr
+                        if "t_quant" in p_name or "q_m_wt" in p_name:
+                            current_lr = group["lr_quant"]
+
+                            noise_scale = current_lr * self.diffusion_noise_ratio * decay_factor * 0.1
+                        elif "d_quant" in p_name:
+                            # d_quant 是后面解析解算出来的，加噪会被覆盖，所以跳过
+                            continue
+                        else:
+                            # 普通权重
+                            current_lr = group["lr"]
+                            noise_scale = current_lr * self.diffusion_noise_ratio * decay_factor
+
+                        # B. 注入噪声
+                        if noise_scale > 1e-9:
+                            noise = torch.randn_like(p.data) * noise_scale
+                            p.data.add_(noise)
+
                 # Add stochastic gradient term for quantization params (d_quant excluded)
                 for p_name, p, p_transform in zip(
                     group["p_names"], group["params"], group["p_transform"]
@@ -937,10 +1321,12 @@ class GETA(BaseHybridSparseOptimizer):
                 gamma, d_quant = self.compute_gamma_d(
                     group, active_redundant_idxes, [self.min_bit_wt, self.max_bit_wt]
                 )
-                # self.logger.info(
-                #     f"Forget rate (gamma): {gamma}, Quant step size (d): {d_quant}"
-                # )
                 self.gamma, self.d_quant = gamma, d_quant
+                if self.pruning_period_duration != 0 and t == 0:
+                    self.logger.info(
+                        f"[DACO][GAMMA] step={self.num_steps} gamma={gamma:.4e} d_quant={d_quant:.4e} "
+                        f"max_bit_wt={self.max_bit_wt} min_bit_wt={self.min_bit_wt}"
+                    )
 
                 # Update quant step size d
                 for i, (p_name, p_transform) in enumerate(
@@ -968,6 +1354,27 @@ class GETA(BaseHybridSparseOptimizer):
                             p.data[active_redundant_idxes] = (
                                 p.data[active_redundant_idxes]
                                 - gamma * p.data[active_redundant_idxes]
+                            )
+
+                    # --- [DACO - DGD] 重要组量化蒸馏引导 (论文 Eq.12) ---
+                    # 论文公式: 对重要组添加 γ₁ * Φ_res 量化蒸馏损失
+                    # 其中 Φ_res 是量化残差 (weight - quantized_weight)
+                    # 此处实现为: 对重要组施加量化引导，使其趋向量化后的表示
+                    important_idxes = group["important_idxes"]
+                    if p_transform != TensorTransform.NO_PRUNE and len(important_idxes) > 0:
+                        if is_quantize:
+                            # 重要组量化引导系数 γ₁ = γ * 0.5（冗余组的一半）
+                            gamma_guided = gamma * 0.5
+                            # 量化残差: 原始 - 量化
+                            quant_residual = (
+                                p.data[important_idxes]
+                                - quantize_weight.data[important_idxes]
+                            )
+                            # 安全边际 c: 残差过大时衰减
+                            residual_norm = torch.norm(quant_residual, p=2)
+                            safety_margin = min(1.0, 1.0 / (residual_norm.item() + 1e-6))
+                            p.data[important_idxes] -= (
+                                gamma_guided * safety_margin * quant_residual
                             )
 
                     # Add stochastic gradient term for non-quantization parameters

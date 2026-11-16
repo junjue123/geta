@@ -1400,6 +1400,31 @@ class QuantizeConv2dOTO(Conv2dOTO):
         return param_groups
 
 
+class MultiheadAttentionOTO(QKVMultiHeadAttentionOTO):
+    """
+    Support for torch.nn.MultiheadAttention (used in torchvision ViT, SwinTransformer, etc.)
+    torch.nn.MultiheadAttention has: num_heads, head_dim, embed_dim (NOT hidden_size).
+    """
+    def __init__(self, id=None, _type=None, cfg_params=dict(), module=None):
+        super().__init__(id, _type, cfg_params, module)
+        self.is_stem = True
+        self.is_basic = False
+        self.out_key = "out_proj"   # torch.nn.MultiheadAttention uses 'out_proj'
+        self.op_name = "mha"
+
+    def set_attributes(self):
+        # torch.nn.MultiheadAttention attributes
+        self.num_heads = self.module.num_heads
+        self.head_dim = self.module.head_dim
+        if self.prune_mode == "head_dim":
+            self.num_groups = self.head_dim
+        elif self.prune_mode == "num_head":
+            self.num_groups = self.num_heads
+        self.hidden_size = self.module.embed_dim  # embed_dim, NOT hidden_size
+        self.num_components = 3  # Q, K, V (via in_proj_weight)
+        self.num_group_divisible = 2
+
+
 BASIC_MODULES = {
     "ConvTranspose2d": ConvTranspose2dOTO,
     "Conv2d": Conv2dOTO,
@@ -1416,6 +1441,7 @@ BASIC_MODULES = {
     "LayerNorm": LayerNormOTO,
     "SamLayerNorm": LayerNormOTO,
     "PReLU": PReLUOTO,
+    "MultiheadAttention": MultiheadAttentionOTO,  # torch.nn.MultiheadAttention (ViT, Swin)
 }
 
 # Composed modules must contain at least two nodes with trainable variables

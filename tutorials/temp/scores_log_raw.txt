@@ -1,0 +1,252 @@
+Step: 1 | Layer: bn1
+  - magnitude: 8.857009e+00
+  - avg_magnitude: 1.896576e-02
+  - cosine_similarity: 1.065687e+00
+  - taylor_first_order: 8.725161e-01
+  - taylor_second_order: 5.495339e-01
+------------------------------
+Step: 2 | Layer: layer1_0_bn1
+  - magnitude: 5.187846e+00
+  - avg_magnitude: 3.553319e-02
+  - cosine_similarity: 1.198734e+00
+  - taylor_first_order: 5.283177e-01
+  - taylor_second_order: 2.820320e-01
+------------------------------
+Step: 3 | Layer: layer1_1_bn1
+  - magnitude: 4.029118e+00
+  - avg_magnitude: 2.759669e-02
+  - cosine_similarity: 1.332795e+00
+  - taylor_first_order: 3.563732e-01
+  - taylor_second_order: 1.266474e-01
+------------------------------
+Step: 4 | Layer: layer1_2_bn1
+  - magnitude: 2.206810e+00
+  - avg_magnitude: 1.511514e-02
+  - cosine_similarity: 1.344797e+00
+  - taylor_first_order: 1.597809e-01
+  - taylor_second_order: 4.255977e-02
+------------------------------
+Step: 5 | Layer: layer2_0_bn1
+  - magnitude: 3.684017e+00
+  - avg_magnitude: 2.523299e-02
+  - cosine_similarity: 1.329352e+00
+  - taylor_first_order: 4.919071e-01
+  - taylor_second_order: 2.898460e-01
+------------------------------
+Step: 6 | Layer: layer2_0_bn2
+  - magnitude: 5.657747e+00
+  - avg_magnitude: 6.371337e-03
+  - cosine_similarity: 1.071070e+00
+  - taylor_first_order: 1.302454e+00
+  - taylor_second_order: 2.180897e+00
+------------------------------
+Step: 7 | Layer: layer2_1_bn1
+  - magnitude: 1.562998e+00
+  - avg_magnitude: 5.389648e-03
+  - cosine_similarity: 1.749786e+00
+  - taylor_first_order: 2.803708e-01
+  - taylor_second_order: 2.549428e-01
+------------------------------
+Step: 8 | Layer: layer2_2_bn1
+  - magnitude: 3.599673e-01
+  - avg_magnitude: 1.241267e-03
+  - cosine_similarity: 1.838345e+00
+  - taylor_first_order: 8.454096e-02
+  - taylor_second_order: 6.113291e-02
+------------------------------
+Step: 9 | Layer: layer3_0_bn1
+  - magnitude: 1.776200e+00
+  - avg_magnitude: 6.124828e-03
+  - cosine_similarity: 1.696427e+00
+  - taylor_first_order: 2.617844e-01
+  - taylor_second_order: 2.290339e-01
+------------------------------
+Step: 10 | Layer: layer3_0_bn2
+  - magnitude: 4.531913e+00
+  - avg_magnitude: 2.563299e-03
+  - cosine_similarity: 1.340935e+00
+  - taylor_first_order: 7.888715e-01
+  - taylor_second_order: 7.993795e-01
+------------------------------
+Step: 11 | Layer: layer3_1_bn1
+  - magnitude: 2.506248e+00
+  - avg_magnitude: 4.336069e-03
+  - cosine_similarity: 1.528082e+00
+  - taylor_first_order: 3.619345e-01
+  - taylor_second_order: 4.802619e-01
+------------------------------
+Step: 12 | Layer: layer3_2_bn1
+  - magnitude: 4.020917e-01
+  - avg_magnitude: 6.956604e-04
+  - cosine_similarity: 1.826993e+00
+  - taylor_first_order: 7.216709e-02
+  - taylor_second_order: 4.964864e-02
+------------------------------
+Step: 13 | Layer: bn1
+  - magnitude: 8.037579e+00
+  - avg_magnitude: 1.721109e-02
+  - cosine_similarity: 1.051966e+00
+  - taylor_first_order: 5.778499e-01
+  - taylor_second_order: 3.764911e-01
+------------------------------
+Step: 14 | Layer: layer1_0_bn1
+  - magnitude: 4.957846e+00
+  - avg_magnitude: 3.395784e-02
+  - cosine_similarity: 1.182616e+00
+  - taylor_first_order: 3.099577e-01
+  - taylor_second_order: 9.904043e-02
+------------------------------
+Step: 15 | Layer: layer1_1_bn1
+  - magnitude: 3.642269e+00
+  - avg_magnitude: 2.494705e-02
+  - cosine_similarity: 1.289388e+00
+  - taylor_first_order: 3.283301e-01
+  - taylor_second_order: 1.152919e-01
+------------------------------
+Step: 16 | Layer: layer1_2_bn1
+  - magnitude: 1.651221e+00
+  - avg_magnitude: 1.130973e-02
+  - cosine_similarity: 1.478376e+00
+  - taylor_first_order: 1.326478e-01
+  - taylor_second_order: 2.365438e-02
+------------------------------
+Step: 17 | Layer: layer2_0_bn1
+  - magnitude: 3.564902e+00
+  - avg_magnitude: 2.441714e-02
+  - cosine_similarity: 1.249788e+00
+  - taylor_first_order: 4.190390e-01
+  - taylor_second_order: 2.357386e-01
+------------------------------
+Step: 18 | Layer: layer2_0_bn2
+  - magnitude: 5.248164e+00
+  - avg_magnitude: 5.910095e-03
+  - cosine_similarity: 1.164160e+00
+  - taylor_first_order: 8.834187e-01
+  - taylor_second_order: 1.263977e+00
+------------------------------
+Step: 19 | Layer: layer2_1_bn1
+  - magnitude: 1.236356e+00
+  - avg_magnitude: 4.263295e-03
+  - cosine_similarity: 1.745178e+00
+  - taylor_first_order: 5.469072e-01
+  - taylor_second_order: 1.389990e+00
+------------------------------
+Step: 20 | Layer: layer2_2_bn1
+  - magnitude: 2.672864e-01
+  - avg_magnitude: 9.216774e-04
+  - cosine_similarity: 1.802767e+00
+  - taylor_first_order: 7.397324e-02
+  - taylor_second_order: 4.080980e-02
+------------------------------
+Step: 21 | Layer: layer3_0_bn1
+  - magnitude: 1.510620e+00
+  - avg_magnitude: 5.209033e-03
+  - cosine_similarity: 1.738889e+00
+  - taylor_first_order: 2.219480e-01
+  - taylor_second_order: 2.587000e-01
+------------------------------
+Step: 22 | Layer: layer3_0_bn2
+  - magnitude: 4.132085e+00
+  - avg_magnitude: 2.337152e-03
+  - cosine_similarity: 1.394245e+00
+  - taylor_first_order: 6.341731e-01
+  - taylor_second_order: 8.800128e-01
+------------------------------
+Step: 23 | Layer: layer3_1_bn1
+  - magnitude: 2.113525e+00
+  - avg_magnitude: 3.656618e-03
+  - cosine_similarity: 1.581497e+00
+  - taylor_first_order: 4.433036e-01
+  - taylor_second_order: 6.978531e-01
+------------------------------
+Step: 24 | Layer: layer3_2_bn1
+  - magnitude: 2.570488e-01
+  - avg_magnitude: 4.447211e-04
+  - cosine_similarity: 1.889221e+00
+  - taylor_first_order: 2.858148e-01
+  - taylor_second_order: 2.372038e+00
+------------------------------
+Step: 25 | Layer: bn1
+  - magnitude: 8.171455e+00
+  - avg_magnitude: 1.749776e-02
+  - cosine_similarity: 1.037373e+00
+  - taylor_first_order: 7.948251e-01
+  - taylor_second_order: 7.327856e-01
+------------------------------
+Step: 26 | Layer: layer1_0_bn1
+  - magnitude: 4.964409e+00
+  - avg_magnitude: 3.400280e-02
+  - cosine_similarity: 1.200454e+00
+  - taylor_first_order: 4.011084e-01
+  - taylor_second_order: 1.697474e-01
+------------------------------
+Step: 27 | Layer: layer1_1_bn1
+  - magnitude: 3.639617e+00
+  - avg_magnitude: 2.492888e-02
+  - cosine_similarity: 1.369845e+00
+  - taylor_first_order: 3.870832e-01
+  - taylor_second_order: 1.703932e-01
+------------------------------
+Step: 28 | Layer: layer1_2_bn1
+  - magnitude: 1.471743e+00
+  - avg_magnitude: 1.008043e-02
+  - cosine_similarity: 1.749442e+00
+  - taylor_first_order: 2.207814e-01
+  - taylor_second_order: 1.230913e-01
+------------------------------
+Step: 29 | Layer: layer2_0_bn1
+  - magnitude: 3.548938e+00
+  - avg_magnitude: 2.430779e-02
+  - cosine_similarity: 1.355612e+00
+  - taylor_first_order: 5.910870e-01
+  - taylor_second_order: 6.008481e-01
+------------------------------
+Step: 30 | Layer: layer2_0_bn2
+  - magnitude: 5.120581e+00
+  - avg_magnitude: 5.766420e-03
+  - cosine_similarity: 1.254646e+00
+  - taylor_first_order: 9.452199e-01
+  - taylor_second_order: 2.784449e+00
+------------------------------
+Step: 31 | Layer: layer2_1_bn1
+  - magnitude: 9.341839e-01
+  - avg_magnitude: 3.221324e-03
+  - cosine_similarity: 1.853900e+00
+  - taylor_first_order: 1.847295e-01
+  - taylor_second_order: 1.671540e-01
+------------------------------
+Step: 32 | Layer: layer2_2_bn1
+  - magnitude: 2.046071e-01
+  - avg_magnitude: 7.055419e-04
+  - cosine_similarity: 1.881572e+00
+  - taylor_first_order: 4.210621e-02
+  - taylor_second_order: 1.826984e-02
+------------------------------
+Step: 33 | Layer: layer3_0_bn1
+  - magnitude: 1.516996e+00
+  - avg_magnitude: 5.231021e-03
+  - cosine_similarity: 1.768552e+00
+  - taylor_first_order: 2.300997e-01
+  - taylor_second_order: 2.182664e-01
+------------------------------
+Step: 34 | Layer: layer3_0_bn2
+  - magnitude: 4.003021e+00
+  - avg_magnitude: 2.264152e-03
+  - cosine_similarity: 1.387841e+00
+  - taylor_first_order: 6.641049e-01
+  - taylor_second_order: 7.934889e-01
+------------------------------
+Step: 35 | Layer: layer3_1_bn1
+  - magnitude: 1.778103e+00
+  - avg_magnitude: 3.076303e-03
+  - cosine_similarity: 1.674285e+00
+  - taylor_first_order: 3.415735e-01
+  - taylor_second_order: 4.061837e-01
+------------------------------
+Step: 36 | Layer: layer3_2_bn1
+  - magnitude: 1.573474e-01
+  - avg_magnitude: 2.722273e-04
+  - cosine_similarity: 1.940100e+00
+  - taylor_first_order: 3.066678e-02
+  - taylor_second_order: 2.988306e-02
+------------------------------

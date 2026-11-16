@@ -1,0 +1,1622 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GETA 框架任务配置</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #161b22;
+    --panel2: #1c2128;
+    --border: #30363d;
+    --accent: #58a6ff;
+    --accent2: #238636;
+    --accent3: #f78166;
+    --text: #e6edf3;
+    --text2: #8b949e;
+    --text3: #6e7681;
+    --tag-bg: #1f2937;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+
+  /* ── 顶栏 ── */
+  header {
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    padding: 0 24px;
+    height: 56px;
+    display: flex;
+    align-items: center;
+    gap: 32px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+  .logo {
+    font-size: 18px;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: -0.5px;
+  }
+  .logo span { color: var(--text2); font-weight: 400; font-size: 14px; margin-left: 8px; }
+  .header-nav { display: flex; gap: 4px; }
+  .nav-btn {
+    padding: 6px 14px;
+    border-radius: 6px;
+    border: none;
+    background: transparent;
+    color: var(--text2);
+    font-size: 13px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .nav-btn:hover { background: var(--panel2); color: var(--text); }
+  .nav-btn.active { background: var(--panel2); color: var(--accent); }
+
+  /* ── 主布局 ── */
+  .main-layout {
+    display: flex;
+    height: calc(100vh - 56px);
+  }
+
+  /* ── 左侧边栏 ── */
+  .sidebar {
+    width: 240px;
+    min-width: 240px;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+    padding: 16px 0;
+  }
+  .sidebar-section { margin-bottom: 4px; }
+  .sidebar-title {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    color: var(--text3);
+    padding: 8px 16px 4px;
+    font-weight: 600;
+  }
+  .sidebar-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    font-size: 13px;
+    color: var(--text2);
+    cursor: pointer;
+    border-left: 2px solid transparent;
+    transition: all 0.1s;
+  }
+  .sidebar-item:hover { background: var(--panel2); color: var(--text); }
+  .sidebar-item.active {
+    background: var(--panel2);
+    color: var(--accent);
+    border-left-color: var(--accent);
+  }
+  .sidebar-item .icon { font-size: 14px; width: 18px; text-align: center; }
+  .sidebar-item .badge {
+    margin-left: auto;
+    background: var(--accent2);
+    color: white;
+    font-size: 10px;
+    padding: 1px 5px;
+    border-radius: 10px;
+    font-weight: 600;
+  }
+
+  /* ── 内容区 ── */
+  .content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24px;
+  }
+
+  /* ── 面板 ── */
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 16px;
+    overflow: hidden;
+  }
+  .panel-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    background: var(--panel2);
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    user-select: none;
+  }
+  .panel-header .arrow {
+    font-size: 10px;
+    color: var(--text3);
+    transition: transform 0.2s;
+  }
+  .panel-header.open .arrow { transform: rotate(90deg); }
+  .panel-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .panel-title .subtitle {
+    font-size: 11px;
+    color: var(--text3);
+    font-weight: 400;
+    margin-left: 8px;
+  }
+  .panel-body {
+    padding: 16px;
+    display: none;
+  }
+  .panel-body.open { display: block; }
+
+  /* ── 表单 ── */
+  .form-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px 24px;
+  }
+  .form-grid.single { grid-template-columns: 1fr; }
+  .form-group {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .form-group.full { grid-column: 1 / -1; }
+  label {
+    font-size: 12px;
+    color: var(--text2);
+    font-weight: 500;
+  }
+  .label-hint {
+    font-size: 10px;
+    color: var(--text3);
+    font-weight: 400;
+    margin-left: 4px;
+  }
+  input[type="text"],
+  input[type="number"],
+  select {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 13px;
+    padding: 7px 10px;
+    width: 100%;
+    transition: border-color 0.15s;
+    font-family: inherit;
+  }
+  input:focus, select:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  input[type="range"] {
+    width: 100%;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  .range-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .range-val {
+    font-size: 12px;
+    color: var(--accent);
+    font-weight: 600;
+    min-width: 38px;
+    text-align: right;
+  }
+  .form-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .form-row:last-child { border-bottom: none; }
+  .toggle {
+    position: relative;
+    width: 36px;
+    height: 20px;
+    flex-shrink: 0;
+  }
+  .toggle input { opacity: 0; width: 0; height: 0; }
+  .toggle-slider {
+    position: absolute;
+    inset: 0;
+    background: var(--border);
+    border-radius: 10px;
+    cursor: pointer;
+    transition: 0.2s;
+  }
+  .toggle-slider::before {
+    content: '';
+    position: absolute;
+    width: 14px;
+    height: 14px;
+    left: 3px;
+    top: 3px;
+    background: white;
+    border-radius: 50%;
+    transition: 0.2s;
+  }
+  .toggle input:checked + .toggle-slider { background: var(--accent2); }
+  .toggle input:checked + .toggle-slider::before { transform: translateX(16px); }
+  .toggle-label {
+    font-size: 13px;
+    color: var(--text2);
+    flex: 1;
+  }
+  .section-divider {
+    border: none;
+    border-top: 1px solid var(--border);
+    margin: 16px 0;
+  }
+
+  /* ── 按钮 ── */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 16px;
+    border-radius: 6px;
+    border: none;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+    font-family: inherit;
+  }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { background: #79b8ff; }
+  .btn-secondary { background: var(--panel2); color: var(--text); border: 1px solid var(--border); }
+  .btn-secondary:hover { background: var(--border); }
+  .btn-danger { background: var(--accent3); color: #fff; }
+  .btn-sm { padding: 5px 10px; font-size: 12px; }
+
+  /* ── 预设卡片 ── */
+  .preset-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  .preset-card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .preset-card:hover { border-color: var(--accent); background: var(--panel2); }
+  .preset-card.selected { border-color: var(--accent); background: rgba(88,166,255,0.08); }
+  .preset-card .name { font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+  .preset-card .desc { font-size: 11px; color: var(--text3); line-height: 1.4; }
+  .preset-card .tags { display: flex; gap: 4px; margin-top: 6px; flex-wrap: wrap; }
+  .preset-card .tag {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--tag-bg);
+    color: var(--text2);
+  }
+
+  /* ── 代码预览 ── */
+  .code-panel {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .code-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--panel2);
+    border-bottom: 1px solid var(--border);
+  }
+  .code-dots { display: flex; gap: 5px; }
+  .code-dot { width: 10px; height: 10px; border-radius: 50%; }
+  .code-dot.r { background: #ff5f57; }
+  .code-dot.y { background: #febc2e; }
+  .code-dot.g { background: #28c840; }
+  .code-title { font-size: 12px; color: var(--text3); margin-left: 8px; }
+  .code-actions { margin-left: auto; display: flex; gap: 6px; }
+  pre {
+    padding: 16px;
+    font-family: 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--text2);
+    overflow-x: auto;
+    max-height: 480px;
+    white-space: pre;
+  }
+  .kw { color: #ff7b72; }
+  .str { color: #a5d6ff; }
+  .cmt { color: var(--text3); font-style: italic; }
+  .fn { color: #d2a8ff; }
+  .num { color: #79c0ff; }
+  .key { color: #7ee787; }
+
+  /* ── 底部操作栏 ── */
+  .bottom-bar {
+    position: fixed;
+    bottom: 0;
+    left: 240px;
+    right: 0;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    z-index: 50;
+  }
+  .status-pill {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text2);
+    background: var(--bg);
+    padding: 5px 10px;
+    border-radius: 20px;
+    border: 1px solid var(--border);
+  }
+  .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--text3); }
+  .status-dot.ready { background: var(--accent2); }
+  .status-dot.error { background: var(--accent3); }
+  .bottom-actions { margin-left: auto; display: flex; gap: 8px; }
+
+  /* ── Tab 区段 ── */
+  .tab-bar {
+    display: flex;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 16px;
+  }
+  .tab-btn {
+    padding: 8px 16px;
+    border: none;
+    background: transparent;
+    color: var(--text2);
+    font-size: 13px;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    transition: all 0.15s;
+  }
+  .tab-btn:hover { color: var(--text); }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  /* ── 进度指示器 ── */
+  .progress-bar {
+    background: var(--bg);
+    border-radius: 4px;
+    height: 6px;
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    background: var(--accent);
+    border-radius: 4px;
+    transition: width 0.3s;
+  }
+  .progress-info {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: var(--text3);
+    margin-top: 4px;
+  }
+
+  /* ── 通知 Toast ── */
+  .toast {
+    position: fixed;
+    bottom: 80px;
+    right: 24px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 16px;
+    font-size: 13px;
+    z-index: 200;
+    display: none;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+  }
+  .toast.show { display: flex; align-items: center; gap: 8px; }
+  .toast.success { border-left: 3px solid var(--accent2); }
+  .toast.error { border-left: 3px solid var(--accent3); }
+</style>
+</head>
+<body>
+
+<!-- 顶栏 -->
+<header>
+  <div class="logo">GETA<span>任务配置台</span></div>
+  <nav class="header-nav">
+    <button class="nav-btn active" onclick="switchView('config')">参数配置</button>
+    <button class="nav-btn" onclick="switchView('preview')">代码预览</button>
+    <button class="nav-btn" onclick="switchView('log')">训练日志</button>
+  </nav>
+</header>
+
+<div class="main-layout">
+  <!-- 侧边栏 -->
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-title">模型</div>
+      <div class="sidebar-item active" onclick="scrollTo('model-panel')">
+        <span class="icon">🧠</span> 模型选择
+        <span class="badge">必选</span>
+      </div>
+      <div class="sidebar-item" onclick="scrollTo('quant-panel')">
+        <span class="icon">⚡</span> 量化配置
+      </div>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-title">压缩</div>
+      <div class="sidebar-item" onclick="scrollTo('pruning-panel')">
+        <span class="icon">✂️</span> 剪枝参数
+        <span class="badge">重要</span>
+      </div>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-title">蒸馏</div>
+      <div class="sidebar-item" onclick="scrollTo('distillation-panel')">
+        <span class="icon">📚</span> 蒸馏配置
+      </div>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-title">训练</div>
+      <div class="sidebar-item" onclick="scrollTo('optimizer-panel')">
+        <span class="icon">⚙️</span> 优化器
+      </div>
+      <div class="sidebar-item" onclick="scrollTo('training-panel')">
+        <span class="icon">🔥</span> 训练参数
+      </div>
+    </div>
+    <div class="sidebar-section">
+      <div class="sidebar-title">导出</div>
+      <div class="sidebar-item" onclick="scrollTo('export-panel')">
+        <span class="icon">📦</span> 模型导出
+      </div>
+    </div>
+  </aside>
+
+  <!-- 内容区 -->
+  <div class="content" id="content-area">
+
+    <!-- 1. 模型选择 -->
+    <div class="panel open" id="model-panel">
+      <div class="panel-header open" onclick="togglePanel(this)">
+        <span class="arrow">▶</span>
+        <div class="panel-title">🧠 模型选择 <span class="subtitle">Model Selection</span></div>
+      </div>
+      <div class="panel-body open">
+        <div class="preset-grid" id="model-presets">
+          <div class="preset-card selected" onclick="selectPreset(this, 'vgg7')" data-model="vgg7">
+            <div class="name">VGG7 (CIFAR10)</div>
+            <div class="desc">标准 CNN 基线，适合快速验证剪枝与量化流程</div>
+            <div class="tags">
+              <span class="tag">CNN</span>
+              <span class="tag">CIFAR10</span>
+              <span class="tag">≈1M params</span>
+            </div>
+          </div>
+          <div class="preset-card" onclick="selectPreset(this, 'resnet20')" data-model="resnet20">
+            <div class="name">ResNet20 (CIFAR10)</div>
+            <div class="desc">残差网络，适合验证结构化剪枝效果</div>
+            <div class="tags">
+              <span class="tag">ResNet</span>
+              <span class="tag">CIFAR10</span>
+              <span class="tag">≈270K params</span>
+            </div>
+          </div>
+          <div class="preset-card" onclick="selectPreset(this, 'resnet56')" data-model="resnet56">
+            <div class="name">ResNet56 (CIFAR10)</div>
+            <div class="desc">更深残差网络，适合高压缩比场景</div>
+            <div class="tags">
+              <span class="tag">ResNet</span>
+              <span class="tag">CIFAR10</span>
+              <span class="tag">≈855K params</span>
+            </div>
+          </div>
+          <div class="preset-card" onclick="selectPreset(this, 'mobilenetv1')" data-model="mobilenetv1">
+            <div class="name">MobileNetV1 (CIFAR10)</div>
+            <div class="desc">深度可分离卷积，适合移动端部署</div>
+            <div class="tags">
+              <span class="tag">MobileNet</span>
+              <span class="tag">CIFAR10</span>
+              <span class="tag">≈3.2M params</span>
+            </div>
+          </div>
+          <div class="preset-card" onclick="selectPreset(this, 'mobilenetv2')" data-model="mobilenetv2">
+            <div class="name">MobileNetV2 (CIFAR10)</div>
+            <div class="desc">逆残差结构，EfficientNet 前身</div>
+            <div class="tags">
+              <span class="tag">MobileNet</span>
+              <span class="tag">CIFAR10</span>
+              <span class="tag">≈2.3M params</span>
+            </div>
+          </div>
+          <div class="preset-card" onclick="selectPreset(this, 'custom')" data-model="custom">
+            <div class="name">自定义模型</div>
+            <div class="desc">通过 Python 类名导入自定义模型</div>
+            <div class="tags">
+              <span class="tag">自定义</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="form-grid">
+          <div class="form-group">
+            <label>模型类名 <span class="label-hint">Python class</span></label>
+            <input type="text" id="model_class" value="vgg7_bn" placeholder="e.g. vgg7_bn, resnet20_cifar10">
+          </div>
+          <div class="form-group">
+            <label>模块路径 <span class="label-hint">import path</span></label>
+            <input type="text" id="model_path" value="sanity_check.backends.vgg7" placeholder="e.g. sanity_check.backends.vgg7">
+          </div>
+          <div class="form-group">
+            <label>输入尺寸</label>
+            <input type="text" id="input_size" value="(1, 3, 32, 32)" placeholder="(B, C, H, W)">
+          </div>
+          <div class="form-group">
+            <label>类别数</label>
+            <input type="number" id="num_classes" value="10" min="1" max="1000">
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 2. 量化配置 -->
+    <div class="panel" id="quant-panel">
+      <div class="panel-header" onclick="togglePanel(this)">
+        <span class="arrow">▶</span>
+        <div class="panel-title">⚡ 量化配置 <span class="subtitle">Quantization Settings</span></div>
+      </div>
+      <div class="panel-body">
+        <div class="form-grid">
+          <div class="form-group full">
+            <label>量化模式</label>
+            <select id="quant_mode">
+              <option value="WEIGHT_ONLY">仅权重量化 (Weight Only)</option>
+              <option value="ACTIVATION_ONLY">仅激活量化 (Activation Only)</option>
+              <option value="WEIGHT_AND_ACTIVATION" selected>权重+激活量化 (Weight & Activation)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>权重位宽下限</label>
+            <div class="range-row">
+              <input type="range" id="min_bit_wt" min="2" max="16" value="4" oninput="updateRange('min_bit_wt')">
+              <span class="range-val" id="min_bit_wt_val">4 bit</span>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>权重位宽上限</label>
+            <div class="range-row">
+              <input type="range" id="max_bit_wt" min="4" max="32" value="16" oninput="updateRange('max_bit_wt')">
+              <span class="range-val" id="max_bit_wt_val">16 bit</span>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>激活位宽下限</label>
+            <div class="range-row">
+              <input type="range" id="min_bit_at" min="2" max="16" value="4" oninput="updateRange('min_bit_at')">
+              <span class="range-val" id="min_bit_at_val">4 bit</span>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>激活位宽上限</label>
+            <div class="range-row">
+              <input type="range" id="max_bit_at" min="4" max="32" value="16" oninput="updateRange('max_bit_at')">
+              <span class="range-val" id="max_bit_at_val">16 bit</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 3. 剪枝参数 -->
+    <div class="panel" id="pruning-panel">
+      <div class="panel-header" onclick="togglePanel(this)">
+        <span class="arrow">▶</span>
+        <div class="panel-title">✂️ 剪枝参数 <span class="subtitle">Pruning / Sparsity</span></div>
+      </div>
+      <div class="panel-body">
+        <div class="form-grid">
+          <div class="form-group">
+            <label>目标稀疏度</label>
+            <div class="range-row">
+              <input type="range" id="target_group_sparsity" min="0" max="95" value="50" oninput="updateRange('target_group_sparsity')">
+              <span class="range-val" id="target_group_sparsity_val">50%</span>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>剪枝开始 Step (epoch × lenloader)</label>
+            <input type="number" id="start_pruning_step" value="10" min="0">
+          </div>
+          <div class="form-group">
+            <label>剪枝周期数</label>
+            <input type="number" id="pruning_periods" value="5" min="1">
+          </div>
+          <div class="form-group">
+            <label>每周期剪枝步数</label>
+            <input type="number" id="pruning_steps" value="10" min="1">
+          </div>
+          <div class="form-group">
+            <label>位宽缩减步长</label>
+            <input type="number" id="bit_reduction" value="2" min="1" max="8">
+          </div>
+          <div class="form-group">
+            <label>剪枝模式</label>
+            <select id="pruning_mode">
+              <option value="uniform">均匀剪枝 (Uniform)</option>
+              <option value=" Importance" selected>重要性剪枝 (Importance-based)</option>
+              <option value="lagrange">拉格朗日优化 (Lagrangian)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>投影开始 Step</label>
+            <input type="number" id="start_projection_step" value="0" min="0">
+          </div>
+          <div class="form-group">
+            <label>投影周期</label>
+            <input type="number" id="projection_periods" value="5" min="1">
+          </div>
+          <div class="form-group">
+            <label>每周期投影步数</label>
+            <input type="number" id="projection_steps" value="10" min="1">
+          </div>
+          <div class="form-group">
+            <label>重要性分数方法</label>
+            <select id="importance_method">
+              <option value="magnitude">幅值 (Magnitude)</option>
+              <option value="taylor" selected>泰勒展开 (Taylor)</option>
+              <option value="cosine">余弦相似度 (Cosine)</option>
+            </select>
+          </div>
+        </div>
+        <hr class="section-divider">
+        <div class="form-group full">
+          <div class="form-row">
+            <label class="toggle">
+              <input type="checkbox" id="enable_langevin" checked>
+              <span class="toggle-slider"></span>
+            </label>
+            <div class="toggle-label">
+              启用朗之万噪声注入 (Langevin Noise Injection)
+              <div style="font-size:11px;color:var(--text3);margin-top:2px">在梯度更新中加入扩散噪声，提升稀疏结构稳定性</div>
+            </div>
+          </div>
+        </div>
+        <div class="form-grid" id="langevin-options">
+          <div class="form-group">
+            <label>噪声步数</label>
+            <input type="number" id="langevin_steps" value="5" min="1">
+          </div>
+          <div class="form-group">
+            <label>噪声系数</label>
+            <input type="number" id="langevin_coeff" value="0.1" step="0.01" min="0">
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 4. 蒸馏配置 -->
+    <div class="panel" id="distillation-panel">
+      <div class="panel-header" onclick="togglePanel(this)">
+        <span class="arrow">▶</span>
+        <div class="panel-title">📚 蒸馏配置 <span class="subtitle">Knowledge Distillation</span></div>
+      </div>
+      <div class="panel-body">
+        <div class="form-row">
+          <label class="toggle">
+            <input type="checkbox" id="enable_distillation" onchange="toggleDistillation(this)">
+            <span class="toggle-slider"></span>
+          </label>
+          <div class="toggle-label">
+            启用知识蒸馏
+            <div style="font-size:11px;color:var(--text3);margin-top:2px">使用教师模型指导学生模型训练</div>
+          </div>
+        </div>
+
+        <div id="distillation-options" style="display:none">
+          <div class="form-grid">
+            <div class="form-group">
+              <label>蒸馏方式</label>
+              <select id="distill_type" onchange="updateDistillType()">
+                <option value="soft_label">软标签蒸馏 (Soft Label)</option>
+                <option value="feature">特征蒸馏 (Feature-based)</option>
+                <option value="layer_wise" selected>逐层蒸馏 (Layer-wise)</option>
+                <option value="pruning_aware">剪枝感知蒸馏</option>
+                <option value="advanced">高级蒸馏 (Advanced)</option>
+                <option value="optimized">优化蒸馏 (Optimized)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>温度系数</label>
+              <div class="range-row">
+                <input type="range" id="distill_temp" min="1" max="20" value="4" oninput="updateRange('distill_temp')">
+                <span class="range-val" id="distill_temp_val">4.0</span>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>蒸馏损失权重</label>
+              <div class="range-row">
+                <input type="range" id="distill_weight" min="0" max="100" value="30" oninput="updateRange('distill_weight')">
+                <span class="range-val" id="distill_weight_val">0.30</span>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>教师模型</label>
+              <select id="teacher_model">
+                <option value="same">同架构 (Self-Distillation)</option>
+                <option value="larger">更大模型</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>特征对齐权重</label>
+              <input type="number" id="feat_weight" value="0.1" step="0.01" min="0">
+            </div>
+            <div class="form-group">
+              <label>KL散度权重</label>
+              <input type="number" id="kl_weight" value="0.2" step="0.01" min="0">
+            </div>
+          </div>
+          <hr class="section-divider">
+          <div class="form-row">
+            <label class="toggle">
+              <input type="checkbox" id="enable_curriculum" checked>
+              <span class="toggle-slider"></span>
+            </label>
+            <div class="toggle-label">启用课程蒸馏 (Curriculum Distillation)</div>
+          </div>
+          <div class="form-row">
+            <label class="toggle">
+              <input type="checkbox" id="enable_temp_anneal" checked>
+              <span class="toggle-slider"></span>
+            </label>
+            <div class="toggle-label">启用温度退火 (Temperature Annealing)</div>
+          </div>
+          <div class="form-row">
+            <label class="toggle">
+              <input type="checkbox" id="enable_attention_distill">
+              <span class="toggle-slider"></span>
+            </label>
+            <div class="toggle-label">启用注意力对齐蒸馏 (Attention Alignment)</div>
+          </div>
+          <div class="form-row">
+            <label class="toggle">
+              <input type="checkbox" id="enable_online_distill">
+              <span class="toggle-slider"></span>
+            </label>
+            <div class="toggle-label">启用在线蒸馏 (Online Distillation)</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 5. 优化器 -->
+    <div class="panel" id="optimizer-panel">
+      <div class="panel-header" onclick="togglePanel(this)">
+        <span class="arrow">▶</span>
+        <div class="panel-title">⚙️ 优化器配置 <span class="subtitle">Optimizer Settings</span></div>
+      </div>
+      <div class="panel-body">
+        <div class="form-grid">
+          <div class="form-group">
+            <label>优化器变体</label>
+            <select id="oto_variant">
+              <option value="adam">Adam</option>
+              <option value="adamw">AdamW</option>
+              <option value="sgd">SGD</option>
+              <option value="muon">Muon (实验性)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>学习率</label>
+            <input type="number" id="lr" value="0.001" step="0.0001" min="0">
+          </div>
+          <div class="form-group">
+            <label>量化层学习率</label>
+            <input type="number" id="lr_quant" value="0.001" step="0.0001" min="0">
+          </div>
+          <div class="form-group">
+            <label>一阶动量</label>
+            <input type="number" id="first_momentum" value="0.9" step="0.01" min="0" max="1">
+          </div>
+          <div class="form-group">
+            <label>二阶动量</label>
+            <input type="number" id="second_momentum" value="0.999" step="0.001" min="0" max="1">
+          </div>
+          <div class="form-group">
+            <label>权重衰减</label>
+            <input type="number" id="weight_decay" value="0.0001" step="0.00001" min="0">
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 6. 训练参数 -->
+    <div class="panel" id="training-panel">
+      <div class="panel-header" onclick="togglePanel(this)">
+        <span class="arrow">▶</span>
+        <div class="panel-title">🔥 训练参数 <span class="subtitle">Training Hyperparameters</span></div>
+      </div>
+      <div class="panel-body">
+        <div class="form-grid">
+          <div class="form-group">
+            <label>训练 Epochs</label>
+            <input type="number" id="max_epoch" value="200" min="1">
+          </div>
+          <div class="form-group">
+            <label>Batch Size</label>
+            <input type="number" id="batch_size" value="128" min="1">
+          </div>
+          <div class="form-group">
+            <label>数据集</label>
+            <select id="dataset">
+              <option value="cifar10" selected>CIFAR10</option>
+              <option value="cifar100">CIFAR100</option>
+              <option value="imagenet">ImageNet</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>数据目录</label>
+            <input type="text" id="data_dir" value="./datasets" placeholder="./datasets">
+          </div>
+          <div class="form-group">
+            <label>损失函数</label>
+            <select id="criterion">
+              <option value="cross_entropy" selected>CrossEntropyLoss</option>
+              <option value="label_smoothing">Label Smoothing CE</option>
+              <option value="focal">Focal Loss</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Label Smoothing</label>
+            <input type="number" id="label_smoothing" value="0.0" step="0.01" min="0" max="1" disabled id="ls-input">
+          </div>
+          <div class="form-group">
+            <label>学习率调度器</label>
+            <select id="lr_scheduler">
+              <option value="cosine">Cosine Annealing</option>
+              <option value="step">Step LR</option>
+              <option value="multistep">MultiStep LR</option>
+              <option value="none">None (固定)</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Warmup Epochs</label>
+            <input type="number" id="warmup_epochs" value="5" min="0">
+          </div>
+        </div>
+        <hr class="section-divider">
+        <div class="form-row">
+          <label class="toggle">
+            <input type="checkbox" id="enable_checkpoint" checked>
+            <span class="toggle-slider"></span>
+          </label>
+          <div class="toggle-label">启用检查点保存</div>
+        </div>
+        <div class="form-row">
+          <label class="toggle">
+            <input type="checkbox" id="enable_visualization">
+            <span class="toggle-slider"></span>
+          </label>
+          <div class="toggle-label">可视化依赖图 (生成 .gv.pdf)</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 7. 模型导出 -->
+    <div class="panel" id="export-panel">
+      <div class="panel-header" onclick="togglePanel(this)">
+        <span class="arrow">▶</span>
+        <div class="panel-title">📦 模型导出 <span class="subtitle">Export & Deployment</span></div>
+      </div>
+      <div class="panel-body">
+        <div class="form-grid">
+          <div class="form-group">
+            <label>导出目标</label>
+            <select id="export_target">
+              <option value="pytorch" selected>PyTorch (.pt)</option>
+              <option value="onnx">ONNX (.onnx)</option>
+              <option value="tensorrt">TensorRT</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>输出目录</label>
+            <input type="text" id="export_dir" value="./outputs" placeholder="./outputs">
+          </div>
+          <div class="form-group">
+            <label>模型名称</label>
+            <input type="text" id="export_name" value="geta_pruned" placeholder="geta_pruned">
+          </div>
+        </div>
+        <div class="form-row">
+          <label class="toggle">
+            <input type="checkbox" id="export_quant_params" checked>
+            <span class="toggle-slider"></span>
+          </label>
+          <div class="toggle-label">包含量化参数</div>
+        </div>
+        <div class="form-row">
+          <label class="toggle">
+            <input type="checkbox" id="export_optimize">
+            <span class="toggle-slider"></span>
+          </label>
+          <div class="toggle-label">优化推理 (optimize_for_inference)</div>
+        </div>
+        <div class="form-row">
+          <label class="toggle">
+            <input type="checkbox" id="export_cuda_kernel">
+            <span class="toggle-slider"></span>
+          </label>
+          <div class="toggle-label">生成 CUDA Kernel (混合精度优化)</div>
+        </div>
+      </div>
+    </div>
+
+    <div style="height: 80px;"></div>
+  </div>
+</div>
+
+<!-- 底部操作栏 -->
+<div class="bottom-bar">
+  <div class="status-pill">
+    <span class="status-dot" id="status-dot"></span>
+    <span id="status-text">就绪</span>
+  </div>
+  <div style="flex:1;margin:0 16px;">
+    <div class="progress-bar" id="progress-bar" style="display:none">
+      <div class="progress-fill" id="progress-fill" style="width:0%"></div>
+    </div>
+  </div>
+  <div class="bottom-actions">
+    <button class="btn btn-secondary" onclick="loadConfig()">📂 加载配置</button>
+    <button class="btn btn-secondary" onclick="saveConfig()">💾 保存配置</button>
+    <button class="btn btn-secondary" onclick="resetConfig()">🔄 重置</button>
+    <button class="btn btn-primary" onclick="generateScript()">⚡ 生成训练脚本</button>
+    <button class="btn btn-danger" onclick="startTraining()" id="train-btn">🚀 启动训练</button>
+  </div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script>
+// ──────────────────────────────────────────────────────────────
+// 状态
+// ──────────────────────────────────────────────────────────────
+let currentModel = 'vgg7';
+let scriptGenerated = false;
+
+const MODEL_MAP = {
+  vgg7:       { class: 'vgg7_bn',        path: 'sanity_check.backends.vgg7',          input: '(1, 3, 32, 32)', classes: 10 },
+  resnet20:   { class: 'resnet20_cifar10', path: 'sanity_check.backends.resnet20_cifar10', input: '(1, 3, 32, 32)', classes: 10 },
+  resnet56:   { class: 'resnet56_cifar10', path: 'sanity_check.backends.resnet56_cifar10', input: '(1, 3, 32, 32)', classes: 10 },
+  mobilenetv1:{ class: 'mobilenetv1_cifar10', path: 'sanity_check.backends.mobilenetv1', input: '(1, 3, 32, 32)', classes: 10 },
+  mobilenetv2:{ class: 'mobilenetv2_cifar10', path: 'sanity_check.backends.mobilenetv2', input: '(1, 3, 32, 32)', classes: 10 },
+  custom:     { class: '', path: '', input: '(1, 3, 224, 224)', classes: 1000 },
+};
+
+function selectPreset(el, model) {
+  document.querySelectorAll('.preset-card').forEach(c => c.classList.remove('selected'));
+  el.classList.add('selected');
+  currentModel = model;
+  const m = MODEL_MAP[model];
+  document.getElementById('model_class').value = m.class;
+  document.getElementById('model_path').value = m.path;
+  document.getElementById('input_size').value = m.input;
+  document.getElementById('num_classes').value = m.classes;
+  showToast('已加载预设: ' + el.querySelector('.name').textContent, 'success');
+}
+
+// ──────────────────────────────────────────────────────────────
+// 面板折叠
+// ──────────────────────────────────────────────────────────────
+function togglePanel(header) {
+  header.classList.toggle('open');
+  header.nextElementSibling.classList.toggle('open');
+}
+
+function scrollTo(id) {
+  document.getElementById(id).scrollIntoView({ behavior: 'smooth', block: 'start' });
+  document.querySelectorAll('.sidebar-item').forEach(i => i.classList.remove('active'));
+  event.currentTarget.classList.add('active');
+}
+
+// ──────────────────────────────────────────────────────────────
+// Range slider 显示值
+// ──────────────────────────────────────────────────────────────
+function updateRange(id) {
+  const el = document.getElementById(id);
+  const val = document.getElementById(id + '_val');
+  if (id.includes('bit') || id === 'min_bit_wt' || id === 'max_bit_wt' ||
+      id === 'min_bit_at' || id === 'max_bit_at') {
+    val.textContent = el.value + ' bit';
+  } else if (id === 'target_group_sparsity') {
+    val.textContent = el.value + '%';
+  } else if (id === 'distill_temp') {
+    val.textContent = (el.value / 1).toFixed(1);
+  } else if (id === 'distill_weight') {
+    val.textContent = (el.value / 100).toFixed(2);
+  } else {
+    val.textContent = el.value;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────
+// 蒸馏开关
+// ──────────────────────────────────────────────────────────────
+function toggleDistillation(cb) {
+  document.getElementById('distillation-options').style.display = cb.checked ? 'block' : 'none';
+}
+
+function updateDistillType() {
+  // dynamic UI updates based on distill type
+}
+
+// ──────────────────────────────────────────────────────────────
+// Toast
+// ──────────────────────────────────────────────────────────────
+function showToast(msg, type='success') {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast ' + type + ' show';
+  setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+// ──────────────────────────────────────────────────────────────
+// 视图切换
+// ──────────────────────────────────────────────────────────────
+function switchView(view) {
+  document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+  event.currentTarget.classList.add('active');
+  if (view === 'preview') generateScript(true);
+}
+
+// ──────────────────────────────────────────────────────────────
+// 代码生成
+// ──────────────────────────────────────────────────────────────
+function getVal(id) {
+  const el = document.getElementById(id);
+  return el ? el.value : '';
+}
+
+function getChecked(id) {
+  return document.getElementById(id).checked;
+}
+
+function getSelectedText(id) {
+  return document.getElementById(id).selectedOptions[0].text;
+}
+
+function generateScript(silent=false) {
+  const modelClass  = getVal('model_class');
+  const modelPath   = getVal('model_path');
+  const inputSize   = getVal('input_size');
+  const numClasses  = getVal('num_classes');
+  const quantMode   = getVal('quant_mode');
+  const minBitWt    = getVal('min_bit_wt');
+  const maxBitWt    = getVal('max_bit_wt');
+  const minBitAt    = getVal('min_bit_at');
+  const maxBitAt    = getVal('max_bit_at');
+  const sparsity     = getVal('target_group_sparsity') / 100;
+  const startPrune   = getVal('start_pruning_step');
+  const prunePeriods = getVal('pruning_periods');
+  const pruneSteps   = getVal('pruning_steps');
+  const bitRed       = getVal('bit_reduction');
+  const startProj    = getVal('start_projection_step');
+  const projPeriods  = getVal('projection_periods');
+  const projSteps    = getVal('projection_steps');
+  const importance   = getVal('importance_method');
+  const enableLang   = getChecked('enable_langevin');
+  const langSteps    = getVal('langevin_steps');
+  const langCoeff    = getVal('langevin_coeff');
+  const distill      = getChecked('enable_distillation');
+  const distillType  = getVal('distill_type');
+  const distillTemp  = parseFloat(getVal('distill_temp'));
+  const distillWeight= parseInt(getVal('distill_weight')) / 100;
+  const featWeight   = parseFloat(getVal('feat_weight'));
+  const klWeight     = parseFloat(getVal('kl_weight'));
+  const curriculum   = getChecked('enable_curriculum');
+  const tempAnneal   = getChecked('enable_temp_anneal');
+  const attnDist     = getChecked('enable_attention_distill');
+  const onlineDist   = getChecked('enable_online_distill');
+  const variant      = getVal('oto_variant');
+  const lr           = parseFloat(getVal('lr'));
+  const lrQuant      = parseFloat(getVal('lr_quant'));
+  const mom1         = parseFloat(getVal('first_momentum'));
+  const mom2         = parseFloat(getVal('second_momentum'));
+  const wd           = parseFloat(getVal('weight_decay'));
+  const maxEpoch     = getVal('max_epoch');
+  const batchSize    = getVal('batch_size');
+  const dataset      = getVal('dataset');
+  const dataDir      = getVal('data_dir');
+  const lrSched      = getVal('lr_scheduler');
+  const warmup       = getVal('warmup_epochs');
+  const enableCkpt   = getChecked('enable_checkpoint');
+  const enableVis    = getChecked('enable_visualization');
+  const exportTarget = getVal('export_target');
+  const exportDir    = getVal('export_dir');
+  const exportName   = getVal('export_name');
+  const exportQP     = getChecked('export_quant_params');
+  const exportOpt    = getChecked('export_optimize');
+  const exportCuda   = getChecked('export_cuda_kernel');
+  const criterion    = getVal('criterion');
+
+  let distillCode = '';
+  if (distill) {
+    distillCode += `
+    # ── 蒸馏器配置 ──
+    distill_config = {
+        "type": "${distillType}",
+        "temperature": ${distillTemp},
+        "weight": ${distillWeight},
+        "feat_weight": ${featWeight},
+        "kl_weight": ${klWeight},
+        "curriculum": ${curriculum},
+        "temp_anneal": ${tempAnneal},
+        "attention_distill": ${attnDist},
+        "online_distill": ${onlineDist},
+    }
+    print(f"[蒸馏] 类型={distill_config['type']}, T={distill_temp}, weight={distill_weight}")`;
+  }
+
+  let langevinCode = '';
+  if (enableLang) {
+    langevinCode += `
+    # ── 朗之万噪声注入 ──
+    optimizer.set_langevin_noise(steps=${langSteps}, coeff=${langCoeff})`;
+  }
+
+  let distillImportCode = '';
+  let distillInitCode = '';
+  let distillCallCode = '';
+
+  if (distill) {
+    distillImportCode = `
+from only_train_once.distillation.advanced_distiller import AdvancedDistiller
+from only_train_once.distillation.layer_wise_distiller import LayerWiseDistiller
+from only_train_once.distillation.pruning_aware_distiller import PruningAwareDistiller`;
+    distillInitCode = `
+    # ── 初始化蒸馏器 ──
+    if distill_type == "layer_wise":
+        distiller = LayerWiseDistiller(
+            mode='forward', progressive=True, adaptive_temp=True,
+            selective=True, normalize=True,
+            base_weight=${distillWeight}, confidence_threshold=0.7,
+        )
+    elif distill_type == "pruning_aware":
+        distiller = PruningAwareDistiller(
+            weight=${featWeight}, use_projection=True, use_mask=True,
+            use_importance=True, projection_dim=None,
+        )
+    elif distill_type == "advanced":
+        distiller = AdvancedDistiller(
+            use_dynamic_weight=True, use_attention=${attnDist},
+            use_temperature_anneal=${tempAnneal}, use_curriculum=${curriculum},
+            base_weight=${distillWeight},
+        )`;
+    distillCallCode = `
+        # ── 蒸馏损失计算 ──
+        if distill_type in ("layer_wise", "pruning_aware", "advanced"):
+            s_logits = student_model(X)
+            with torch.no_grad():
+                t_logits = teacher_model(X)
+            kd_loss = distiller.compute_loss(
+                student_model=student_model, teacher_model=teacher_model, x=X,
+                student_logits=s_logits, epoch=epoch, max_epoch=max_epoch,
+                base_temperature=${distillTemp},
+            )
+            total_loss = ce_loss + ${distillWeight} * kd_loss`;
+  }
+
+  const criterionImport = criterion === 'cross_entropy'
+    ? '' // default
+    : criterion === 'label_smoothing'
+    ? `\nfrom torch.nn import LabelSmoothingLoss\ncriterion = LabelSmoothingLoss(smoothing=${getVal('label_smoothing')})`
+    : `\n# Focal Loss: 需要先安装 pip install torch==2.x\ncriterion = torch.nn.CrossEntropyLoss()`;
+
+  const lrSchedCode = lrSched === 'cosine'
+    ? `\n    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epoch)`
+    : lrSched === 'step'
+    ? `\n    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)`
+    : lrSched === 'multistep'
+    ? `\n    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[60,120,160], gamma=0.2)`
+    : '\n    scheduler = None  # 固定学习率';
+
+  const visCode = enableVis
+    ? `\n    # ── 可视化依赖图 ──\n    save_dir = "${exportDir}/${exportName}"\n    import os\n    os.makedirs(save_dir, exist_ok=True)\n    oto.visualize(view=False, out_dir=save_dir)`
+    : '';
+
+  const exportCode = exportCuda
+    ? `
+    # ── 生成 CUDA Kernel ──
+    from only_train_once.deployment import extract_model_info
+    from only_train_once.deployment.cuda_generator import CUDAKernelGenerator, KernelSpec
+    mi = extract_model_info(model)
+    gen = CUDAKernelGenerator(output_dir="${exportDir}/${exportName}/cuda", prefix="geta")
+    for name, info in list(mi.layers.items())[:5]:
+        if hasattr(info, 'layer_type'):
+            spec = KernelSpec(
+                name=name, layer_type=info.layer_type,
+                in_channels=info.in_channels,
+                out_channels=getattr(info, 'out_channels', 64),
+                weight_bit=${minBitWt}, activation_bit=${minBitAt},
+                kernel_size=getattr(info, 'kernel_size', 3),
+                stride=getattr(info, 'stride', 1),
+                padding=getattr(info, 'padding', 1),
+            )
+            gen.add_kernel(spec)
+    cuda_files = gen.generate()
+    print(f"[CUDA] 生成了 {len(cuda_files)} 个核函数文件")`
+    : '';
+
+  const exportModelCode = `
+    # ── 导出模型 ──
+    from only_train_once.deployment.exporter import ModelExporter, DeploymentConfig, DeploymentTarget
+    export_cfg = DeploymentConfig()
+    export_cfg.target = DeploymentTarget.${exportTarget.toUpperCase()}
+    export_cfg.optimize_for_inference = ${exportOpt}
+    export_cfg.include_quantization_params = ${exportQP}
+    exporter = ModelExporter(model, export_cfg)
+    result = exporter.export(
+        output_dir="${exportDir}/${exportName}",
+        model_name="${exportName}",
+    )
+    print(f"[导出] 文件: {list(result.keys())}")`;
+
+  const script = `#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+GETA 训练脚本 — 自动生成
+模型: ${modelClass}
+量化模式: ${quantMode}
+目标稀疏度: ${sparsity * 100}%
+位宽范围: [${minBitWt}, ${maxBitWt}] (权重) / [${minBitAt}, ${maxBitAt}] (激活)
+蒸馏: ${distill ? distillType : '未启用'}
+生成时间: ${new Date().toLocaleString('zh-CN')}
+"""
+
+import sys, os, time, math
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import torch
+import torch.nn as nn
+${criterionImport ? criterionImport : "criterion = nn.CrossEntropyLoss()"}
+
+# ── 量化 ──
+from only_train_once.quantization.quant_model import model_to_quantize_model
+from only_train_once.quantization.quant_layers import QuantizationMode
+
+# ── OTO 核心 ──
+from only_train_once import OTO
+${distillImportCode}
+
+# ════════════════════════════════════════════════════════════════
+# 1. 模型构建
+# ════════════════════════════════════════════════════════════════
+model = ${modelPath}.${modelClass}()
+model = model_to_quantize_model(model, quant_mode=QuantizationMode.${quantMode})
+
+dummy_input = torch.rand${inputSize})
+oto = OTO(model=model.cuda(), dummy_input=dummy_input.cuda())
+print(f"[模型] 参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+
+# ════════════════════════════════════════════════════════════════
+# 2. GETA 优化器
+# ════════════════════════════════════════════════════════════════
+optimizer = oto.geta(
+    variant="${variant}",
+    lr=${lr},
+    lr_quant=${lrQuant},
+    first_momentum=${mom1},
+    weight_decay=${wd},
+    target_group_sparsity=${sparsity},
+    start_projection_step=${startProj} * len(trainloader),
+    projection_periods=${projPeriods},
+    projection_steps=${projSteps} * len(trainloader),
+    start_pruning_step=${startPrune} * len(trainloader),
+    pruning_periods=${prunePeriods},
+    pruning_steps=${pruneSteps} * len(trainloader),
+    bit_reduction=${bitRed},
+    min_bit_wt=${minBitWt},
+    max_bit_wt=${maxBitWt},
+    min_bit_at=${minBitAt},
+    max_bit_at=${maxBitAt},
+)${langevinCode}
+print(f"[优化器] 变体=${variant}, 目标稀疏度={sparsity*100:.0f}%, 位宽=[${minBitWt},${maxBitWt}]")
+
+${distillCode}
+${distillInitCode}
+
+# ════════════════════════════════════════════════════════════════
+# 3. 数据加载
+# ════════════════════════════════════════════════════════════════
+import torchvision.datasets as datasets
+import torchvision.transforms as transforms
+
+if "${dataset}" == "cifar10":
+    normalize = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    trainset = datasets.CIFAR10(root="${dataDir}", train=True, download=True,
+        transform=transforms.Compose([
+            transforms.RandomHorizontalFlip(), transforms.RandomCrop(32, 4),
+            transforms.ToTensor(), normalize]))
+    testset  = datasets.CIFAR10(root="${dataDir}", train=False, download=True,
+        transform=transforms.Compose([transforms.ToTensor(), normalize]))
+elif "${dataset}" == "cifar100":
+    normalize = transforms.Normalize([0.507, 0.487, 0.441], [0.267, 0.256, 0.276])
+    trainset = datasets.CIFAR100(root="${dataDir}", train=True, download=True,
+        transform=transforms.Compose([
+            transforms.RandomHorizontalFlip(), transforms.RandomCrop(32, 4),
+            transforms.ToTensor(), normalize]))
+    testset  = datasets.CIFAR100(root="${dataDir}", train=False, download=True,
+        transform=transforms.Compose([transforms.ToTensor(), normalize]))
+else:
+    # ImageNet
+    normalize = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    trainset = datasets.ImageNet(root="${dataDir}", split='train',
+        transform=transforms.Compose([
+            transforms.RandomResizedCrop(224), transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(), normalize]))
+    testset  = datasets.ImageNet(root="${dataDir}", split='val',
+        transform=transforms.Compose([
+            transforms.Resize(256), transforms.CenterCrop(224),
+            transforms.ToTensor(), normalize]))
+
+trainloader = torch.utils.data.DataLoader(trainset, batch_size=${batchSize},
+    shuffle=True, num_workers=4, pin_memory=True)
+testloader = torch.utils.data.DataLoader(testset, batch_size=${batchSize},
+    shuffle=False, num_workers=4, pin_memory=True)
+print(f"[数据] ${dataset}, train={len(trainset)}, test={len(testset)}, batch=${batchSize}")
+
+${lrSchedCode}
+
+# ════════════════════════════════════════════════════════════════
+# 4. 训练循环
+# ════════════════════════════════════════════════════════════════
+max_epoch = ${maxEpoch}
+best_acc = 0.0
+device = torch.device('cuda')
+
+for epoch in range(max_epoch):
+    model.train()
+    train_loss, train_acc = 0.0, 0.0
+    t0 = time.time()
+
+    for X, y in trainloader:
+        X, y = X.cuda(), y.cuda()
+        optimizer.zero_grad()
+        y_pred = model(X)
+        ce_loss = criterion(y_pred, y)${distillCallCode.replace(/\n/g, '\n        ')}
+        total_loss.backward()
+        optimizer.step()
+
+        train_loss += ce_loss.item() * X.size(0)
+        train_acc += (y_pred.argmax(1) == y).sum().item()
+
+    train_loss /= len(trainset)
+    train_acc  /= len(trainset)
+
+    # ── 验证 ──
+    model.eval()
+    val_loss, val_acc = 0.0, 0.0
+    with torch.no_grad():
+        for X, y in testloader:
+            X, y = X.cuda(), y.cuda()
+            y_pred = model(X)
+            val_loss += criterion(y_pred, y).item() * X.size(0)
+            val_acc  += (y_pred.argmax(1) == y).sum().item()
+
+    val_loss /= len(testset)
+    val_acc  /= len(testset)
+
+    if scheduler: scheduler.step()
+    elapsed = time.time() - t0
+
+    lr_now = optimizer.param_groups[0]['lr']
+    print(f"[Epoch {epoch:3d}/{max_epoch}] "
+          f"loss={train_loss:.4f} acc={train_acc:.4f} | "
+          f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} | "
+          f"lr={lr_now:.2e} ({elapsed:.1f}s)")
+
+    if val_acc > best_acc:
+        best_acc = val_acc
+        if ${enableCkpt}:
+            ckpt_path = "${exportDir}/${exportName}/best.pt"
+            os.makedirs("${exportDir}/${exportName}", exist_ok=True)
+            torch.save({
+                'epoch': epoch, 'model': model.state_dict(),
+                'acc': val_acc, 'oto': oto,
+            }, ckpt_path)
+            print(f"  ★ 保存最佳模型: {ckpt_path}")
+
+${visCode}
+${exportCode}
+${exportModelCode}
+print(f"[完成] 最佳验证准确率: {best_acc:.4f}")
+`;
+
+  document.getElementById('content-area').innerHTML = `
+    <div class="panel open">
+      <div class="panel-header open">
+        <span class="arrow">▶</span>
+        <div class="panel-title">⚡ 生成训练脚本 — ${modelClass}</div>
+      </div>
+      <div class="panel-body open">
+        <div class="code-panel">
+          <div class="code-header">
+            <div class="code-dots"><div class="code-dot r"></div><div class="code-dot y"></div><div class="code-dot g"></div></div>
+            <div class="code-title">train_geta_${modelClass}.py</div>
+            <div class="code-actions">
+              <button class="btn btn-secondary btn-sm" onclick="copyScript()">📋 复制</button>
+              <button class="btn btn-secondary btn-sm" onclick="downloadScript()">💾 下载</button>
+              <button class="btn btn-secondary btn-sm" onclick="location.reload()">← 返回</button>
+            </div>
+          </div>
+          <pre id="code-preview">${highlightCode(escapeHtml(script))}</pre>
+        </div>
+      </div>
+    </div>
+    <div style="height:80px"></div>`;
+
+  // Store for later use
+  window._generatedScript = script;
+  scriptGenerated = true;
+  showToast('脚本已生成！可复制或下载', 'success');
+  return script;
+}
+
+function highlightCode(code) {
+  // 简单语法高亮
+  return code
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/(#[^\n]*)/g, '<span class="cmt">$1</span>')
+    .replace(/("""[\s\S]*?"""|'''[\s\S]*?''')/g, '<span class="str">$1</span>')
+    .replace(/\b(def|class|import|from|if|elif|else|for|while|in|return|with|as|not|and|or|True|False|None|print|range|len|sum|list|dict|tuple|str|int|float|bool)\b/g, '<span class="kw">$1</span>')
+    .replace(/(torch\.\w+|nn\.\w+|torchvision\.\w+|only_train_once\.\w+)/g, '<span class="fn">$1</span>')
+    .replace(/\b(\d+\.?\d*)\b/g, '<span class="num">$1</span>')
+    .replace(/("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/g, '<span class="str">$1</span>');
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function copyScript() {
+  navigator.clipboard.writeText(window._generatedScript || '').then(() => {
+    showToast('已复制到剪贴板！', 'success');
+  });
+}
+
+function downloadScript() {
+  const blob = new Blob([window._generatedScript || ''], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'train_geta_' + currentModel + '.py';
+  a.click();
+  URL.revokeObjectURL(a.href);
+  showToast('脚本已下载！', 'success');
+}
+
+// ──────────────────────────────────────────────────────────────
+// 保存/加载配置
+// ──────────────────────────────────────────────────────────────
+function saveConfig() {
+  const config = {};
+  document.querySelectorAll('input, select').forEach(el => {
+    if (el.id) {
+      if (el.type === 'checkbox') config[el.id] = el.checked;
+      else config[el.id] = el.value;
+    }
+  });
+  const json = JSON.stringify(config, null, 2);
+  const blob = new Blob([json], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'geta_config.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+  showToast('配置已保存！', 'success');
+}
+
+function loadConfig() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.json';
+  input.onchange = e => {
+    const file = e.target.files[0];
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const config = JSON.parse(ev.target.result);
+        Object.entries(config).forEach(([k, v]) => {
+          const el = document.getElementById(k);
+          if (el) {
+            if (el.type === 'checkbox') el.checked = v;
+            else el.value = v;
+          }
+        });
+        showToast('配置已加载！', 'success');
+      } catch(e) {
+        showToast('加载失败: ' + e.message, 'error');
+      }
+    };
+    reader.readAsText(file);
+  };
+  input.click();
+}
+
+function resetConfig() {
+  if (confirm('确定要重置所有配置吗？')) location.reload();
+}
+
+// ──────────────────────────────────────────────────────────────
+// 启动训练（模拟）
+// ──────────────────────────────────────────────────────────────
+function startTraining() {
+  generateScript(true);
+  const statusDot = document.getElementById('status-dot');
+  const statusText = document.getElementById('status-text');
+  const progressBar = document.getElementById('progress-bar');
+  const progressFill = document.getElementById('progress-fill');
+  const trainBtn = document.getElementById('train-btn');
+
+  statusDot.className = 'status-dot ready';
+  statusText.textContent = '训练中...';
+  progressBar.style.display = 'block';
+  trainBtn.disabled = true;
+  trainBtn.textContent = '⏳ 训练中';
+
+  let progress = 0;
+  const interval = setInterval(() => {
+    progress += Math.random() * 3;
+    if (progress > 100) progress = 100;
+    progressFill.style.width = progress + '%';
+    if (progress >= 100) {
+      clearInterval(interval);
+      statusDot.className = 'status-dot';
+      statusText.textContent = '就绪';
+      progressBar.style.display = 'none';
+      trainBtn.disabled = false;
+      trainBtn.textContent = '🚀 启动训练';
+      showToast('脚本已生成，请在终端运行！', 'success');
+    }
+  }, 200);
+}
+
+// ──────────────────────────────────────────────────────────────
+// 初始化
+// ──────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  // label smoothing toggle
+  document.getElementById('criterion').addEventListener('change', e => {
+    document.getElementById('ls-input').disabled = e.target.value !== 'label_smoothing';
+  });
+  // 初始化所有 range 显示值
+  ['min_bit_wt','max_bit_wt','min_bit_at','max_bit_at',
+   'target_group_sparsity','distill_temp','distill_weight'].forEach(updateRange);
+});
+</script>
+</body>
+</html>

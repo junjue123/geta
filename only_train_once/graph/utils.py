@@ -3,7 +3,15 @@ import textwrap
 import torch._C._onnx as _C_onnx
 from torch import _C
 from torch.onnx import symbolic_helper
-from torch.onnx._globals import GLOBALS
+
+# 【环境兼容】torch < 1.13 没有 torch.onnx._globals，提供 stub GLOBALS
+try:
+    from torch.onnx._globals import GLOBALS
+except ModuleNotFoundError:
+    class _GLOBALSStub:
+        onnx_shape_inference = False
+        export_onnx_opset_version = 13
+    GLOBALS = _GLOBALSStub()
 
 
 def _is_constant_tensor_list(node):
@@ -255,16 +263,19 @@ def _find_Qlinear_node_info(
     return parent_node, matmul_node, node_info
 
 
-def _find_closest_node_outgoing(graph, node, target_node_op_name, visited_dict=dict()):
+def _find_closest_node_outgoing(graph, node, target_node_op_name, visited_dict=None, _visited=None):
+    if _visited is None:
+        _visited = set()
     if node.op_name == target_node_op_name:
         return node
-    else:
-        for node_out in graph.outgoing(node):
-            if node_out.id in visited_dict:
-                return visited_dict[node_out.id]
-            return _find_closest_node_outgoing(
-                graph, node_out, target_node_op_name, visited_dict
-            )
+    if node.id in _visited:
+        return None  # cycle detected, abort
+    _visited.add(node.id)
+    for node_out in graph.outgoing(node):
+        return _find_closest_node_outgoing(
+            graph, node_out, target_node_op_name, visited_dict, _visited
+        )
+    return None
 
 
 def _find_nodes_between_start_end_nodes(graph, start_nodes, end_node):

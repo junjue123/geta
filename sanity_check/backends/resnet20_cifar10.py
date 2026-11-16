@@ -72,15 +72,22 @@ class ResNet20(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, x, feature_need=False):
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.avg_pool2d(out)
-        out = out.view(out.size(0), -1)
-        out = self.linear(out)
-        return out
+
+        if feature_need:
+            feature = out
+            out = out.view(out.size(0), -1)
+            out = self.linear(out)
+            return out, feature
+        else:
+            out = out.view(out.size(0), -1)
+            out = self.linear(out)
+            return out
 
 def resnet20_cifar10():
     """ return a ResNet 20 object

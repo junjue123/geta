@@ -562,6 +562,8 @@ class Graph:
                 node_linear = _find_closest_node_outgoing(
                     self, node, "gemm", quantize_linear_to_linear
                 )
+                if node_linear is None:
+                    continue
                 if node_linear.id not in linear_to_quantize_linear:
                     linear_to_quantize_linear[node_linear.id] = list()
                 linear_to_quantize_linear[node_linear.id].append(node)
@@ -627,6 +629,8 @@ class Graph:
                 node_conv2d = _find_closest_node_outgoing(
                     self, node, "conv", quantize_conv2d_to_conv2d
                 )
+                if node_conv2d is None:
+                    continue
                 quantize_conv2d_to_conv2d[node.id] = node_conv2d
                 if node_conv2d.id not in conv2d_to_quantize_conv2d:
                     conv2d_to_quantize_conv2d[node_conv2d.id] = list()
@@ -727,9 +731,21 @@ class Graph:
             trace_graph, _ = torch.jit._get_trace_graph(model, dummy_input)
 
         if not optimized_onnx:
-            trace_graph = _optimize_trace_graph_no_onnx_operator(
-                trace_graph, torch.onnx.OperatorExportTypes.ONNX
-            )
+            try:
+                trace_graph = _optimize_trace_graph_no_onnx_operator(
+                    trace_graph, torch.onnx.OperatorExportTypes.ONNX
+                )
+            except (RuntimeError, AssertionError) as e:
+                # Some models (ViT, Swin) use _native_multi_head_attention which
+                # causes internal asserts in _jit_pass_lower_all_tuples.
+                # Fall back to raw trace - the parsing should still work.
+                warnings.warn(
+                    f"Trace optimization failed (non-ONNX path), using raw trace. "
+                    "This may affect graph parsing quality for some models. "
+                    f"Details: {type(e).__name__}: {e}"
+                )
+                # Return the raw trace without any optimization
+                return trace_graph
         else:
             if Version(torch.__version__) >= Version("1.9.0") and Version(
                 torch.__version__
@@ -738,9 +754,29 @@ class Graph:
                     trace_graph, torch.onnx.OperatorExportTypes.ONNX
                 )
             elif Version(torch.__version__) >= Version("1.13.0"):
-                trace_graph = torch.onnx._optimize_graph(
-                    trace_graph, torch.onnx.OperatorExportTypes.ONNX
-                )
+                try:
+                    trace_graph = torch.onnx._optimize_graph(
+                        trace_graph, torch.onnx.OperatorExportTypes.ONNX
+                    )
+                except torch.onnx.errors.UnsupportedOperatorError as e:
+                    # _native_multi_head_attention not supported in ONNX opset 16 (ViT, Swin, etc.)
+                    # Fall back to non-optimized trace
+                    warnings.warn(
+                        f"ONNX optimization failed, falling back to non-optimized trace. "
+                        "This is expected for ViT/Swin Transformers. "
+                        f"Details: {str(e)}"
+                    )
+                    try:
+                        trace_graph = _optimize_trace_graph_no_onnx_operator(
+                            trace_graph, torch.onnx.OperatorExportTypes.ONNX
+                        )
+                    except (RuntimeError, AssertionError) as e2:
+                        # If fallback also fails, return raw trace
+                        warnings.warn(
+                            f"Non-ONNX fallback also failed, using raw trace. "
+                            f"Details: {type(e2).__name__}: {e2}"
+                        )
+                        return trace_graph
             else:
                 raise "Torch {} is not supported because of some bug in _optimize_trace.".format(
                     torch.__version__

@@ -3,7 +3,7 @@ import os
 
 from .dependency_graph import build_pruning_dependency_graph
 from .graph import Graph
-from .optimizer import GETA, HESSO
+from .optimizer import GETA, HESSO, MyGETA
 from .subnet_construction import automated_pruning_compression
 
 
@@ -150,6 +150,62 @@ class OTO:
         log_dir="outputs",
     ):
         self._optimizer = GETA(
+            params=self._graph.get_param_groups(),
+            lr=lr,
+            lr_quant=lr_quant,
+            weight_decay=weight_decay,
+            first_momentum=first_momentum,
+            second_momentum=second_momentum,
+            dampening=dampening,
+            variant=variant,
+            target_group_sparsity=target_group_sparsity,
+            start_projection_step=start_projection_step,
+            projection_steps=projection_steps,
+            projection_periods=projection_periods,
+            start_pruning_step=start_pruning_step,
+            pruning_periods=pruning_periods,
+            pruning_steps=pruning_steps,
+            group_divisible=group_divisible,
+            importance_score_criteria=importance_score_criteria,
+            bit_reduction=bit_reduction,
+            min_bit_wt=min_bit_wt,
+            max_bit_wt=max_bit_wt,
+            min_bit_act=min_bit_act,
+            max_bit_act=max_bit_act,
+        )
+        return self._optimizer
+
+    def mygeta(
+            self,
+            lr=0.1,
+            lr_quant=1e-3,
+            weight_decay=None,
+            first_momentum=None,
+            second_momentum=None,
+            variant="sgd",
+            target_group_sparsity=0.5,
+            start_projection_step=0,
+            projection_steps=1,
+            projection_periods=1,
+            start_pruning_step=1,
+            pruning_steps=1,
+            pruning_periods=1,
+            dampening=None,
+            group_divisible=1,
+            fixed_zero_groups=True,
+            importance_score_criteria="default",
+            bit_reduction=2,
+            min_bit_wt=2,
+            max_bit_wt=16,
+            min_bit_act=2,
+            max_bit_act=16,
+            grad_clip_min=-1.0,
+            grad_clip_max=1.0,
+            verbose="False",
+            device="cuda",
+            log_dir="outputs",
+    ):
+        self._optimizer = MyGETA(
             params=self._graph.get_param_groups(),
             lr=lr,
             lr_quant=lr_quant,
