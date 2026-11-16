@@ -109,6 +109,10 @@ class DistillRuntime:
         if cfg["weight"]["enabled"]:
             self.anchor = {n: p.detach().clone()
                            for n, p in model.named_parameters() if p.numel() > 0}
+            # 锚点全程不变, 范数与非零个数只需算一次: 投影每步都在为 197 个张量
+            # 重算 a.norm() 与 (a != 0).sum(), 实测 opt+proj 段能占到单步 20%。
+            self._anchor_norm = {n: float(a.norm()) for n, a in self.anchor.items()}
+            self._anchor_nnz = {n: int((a != 0).sum()) for n, a in self.anchor.items()}
             self.log("DISTILL", f"参数层锚点已冻结: {len(self.anchor)} 个张量; "
                                 f"ε0={cfg['weight']['epsilon0']} "
                                 f"schedule={cfg['weight']['schedule']}")

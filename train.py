@@ -624,12 +624,16 @@ def train_one_epoch(model, opt, loader, criterion, device, epoch, scheduler,
             prof["bwd"] += time.perf_counter() - t0
             t0 = time.perf_counter()
         opt.step()
+        if use_prof:
+            torch.cuda.synchronize()
+            prof["opt"] += time.perf_counter() - t0
+            t0 = time.perf_counter()
         if runtime is not None:
             # 必须在 step 之后: 先让优化器走一步, 再拉回 ε-球内, 顺序反了就等于没约束
             stats.update(runtime.project_weights(progress))
         if use_prof:
             torch.cuda.synchronize()
-            prof["opt"] += time.perf_counter() - t0
+            prof["proj"] += time.perf_counter() - t0
             t0 = time.perf_counter()
         if scheduler is not None:
             scheduler.step()
