@@ -25,15 +25,23 @@ import torch
 _CKPT_EP = re.compile(r"_ep(\d+)\.pt$")
 
 
-def discover_hist_candidates(out_dir, model_name, mode):
-    """扫描 {out}/checkpoints 下按 epoch 命名的快照, 返回 [(epoch, path), ...]。"""
+def discover_hist_candidates(out_dir, model_name, mode,
+                             prefix_mode=None, max_epoch=None):
+    """扫描 {out}/checkpoints 下按 epoch 命名的快照, 返回 [(epoch, path), ...]。
+
+    prefix_mode 默认跟当前 run 一致; 跨目录取教师时(例如用 warmup_100 里的
+    baseline 快照当教师)需要显式给。
+    """
     ckpt_dir = os.path.join(out_dir, "checkpoints")
-    pat = os.path.join(ckpt_dir, f"{model_name}_{mode}_ep*.pt")
+    pat = os.path.join(ckpt_dir, f"{model_name}_{prefix_mode or mode}_ep*.pt")
     out = []
     for p in glob.glob(pat):
         m = _CKPT_EP.search(os.path.basename(p))
         if m:
-            out.append((int(m.group(1)), p))
+            ep = int(m.group(1))
+            if max_epoch is not None and ep > max_epoch:
+                continue
+            out.append((ep, p))
     return sorted(out)
 
 
@@ -106,10 +114,15 @@ class TeacherPool:
     def _build_hist(self, hcfg, out_dir, model_name, mode, model_factory):
         if not hcfg["enabled"]:
             return
-        cands = discover_hist_candidates(out_dir, model_name, mode)
+        # 教师来源目录: 默认取本次 run 的 out_dir。跨目录(把"压缩前的起点模型"
+        # 当教师)时由配置指定, 前缀里的 mode 也要跟着变。
+        src_dir = hcfg.get("source_dir") or out_dir
+        cands = discover_hist_candidates(src_dir, model_name,
+                                         hcfg.get("source_mode") or mode)
         if not cands:
             self.notes.append(
-                f"T_hist 未建成: {out_dir}/checkpoints 下没有 {model_name}_{mode}_ep*.pt; "
+                f"T_hist 未建成: {src_dir}/checkpoints 下没有 "
+                f"{model_name}_{hcfg.get('source_mode') or mode}_ep*.pt; "
                 "依赖它的特征层与 ref 位本次运行会自动关闭")
             self._log("DISTILL", self.notes[-1])
             return

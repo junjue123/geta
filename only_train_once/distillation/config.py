@@ -50,6 +50,8 @@ DISTILL_DEFAULTS = {
             "coordinate": "compression", # compression | epoch_even
             "weight": "ib",              # ib | uniform
             "pick": "earliest",          # earliest | mid | end (E4 的 K=1 取样口径)
+            "source_dir": "",            # 空 = 本次 run 的 out; 可指向别的实验目录
+            "source_mode": "",           # 空 = 本次 mode; 跨目录时要写(resnet20_baseline_ep* 等)
             "admit_acc_delta": 0.02,     # acc >= acc(theta_t) - delta 才准入
             "weight": "ib",              # ib | uniform
         },
