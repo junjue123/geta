@@ -29,9 +29,13 @@ TAPS = ["layer1", "layer2", "layer3", "avg_pool"]
 
 
 def load(path):
-    m, _ = T.build_model("resnet20", DEV)
+    """按 ckpt 内容决定建不建量化模型: 热身阶段产出的全精度权重里没有 d_quant 键,
+    硬灌进量化模型会全部落在 missing 里(看起来"加载成功", 其实权重没进去)。"""
     ck = torch.load(path, map_location=DEV, weights_only=False)
-    m.load_state_dict(ck["model"])
+    sd = ck["model"]
+    quantized = any("d_quant" in k for k in sd)
+    m, _ = T.build_model("resnet20", DEV, quantize=quantized)
+    m.load_state_dict(sd)
     m.eval()
     return m, ck.get("epoch")
 

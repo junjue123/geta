@@ -88,6 +88,7 @@ from torch.utils.data import DataLoader
 from only_train_once import OTO
 from only_train_once.quantization.quant_model import model_to_quantize_model
 from only_train_once.quantization.quant_layers import QuantizationMode
+from only_train_once.quantization import quant_layers as QL
 
 
 def _resolve_data_dir(p):
@@ -418,7 +419,9 @@ def get_dataloaders(data_dir, batch_size=128, num_workers=4, seed=1,
 # ===========================================================================
 # 模型构建
 # ===========================================================================
-def build_model(model_name, device, quant_mode="weight_and_activation"):
+def build_model(model_name, device, quant_mode="weight_and_activation",
+                quantize=True):
+    """quantize=False 时只建全精度模型, 供"热身阶段不做量化"的流程使用。"""
     if model_name == "resnet20":
         from sanity_check.backends.resnet20_cifar10 import resnet20_cifar10
         model = resnet20_cifar10()
@@ -428,9 +431,10 @@ def build_model(model_name, device, quant_mode="weight_and_activation"):
     else:
         raise ValueError(f"Unknown model: {model_name}")
     dummy = torch.rand(1, 3, 32, 32)
-    qm = (QuantizationMode.WEIGHT_ONLY if quant_mode == "weight_only"
-          else QuantizationMode.WEIGHT_AND_ACTIVATION)
-    model = model_to_quantize_model(model, quant_mode=qm)
+    if quantize:
+        qm = (QuantizationMode.WEIGHT_ONLY if quant_mode == "weight_only"
+              else QuantizationMode.WEIGHT_AND_ACTIVATION)
+        model = model_to_quantize_model(model, quant_mode=qm)
     model = model.to(device)
     return model, dummy
 
@@ -647,6 +651,8 @@ def train_one_epoch(model, opt, loader, criterion, device, epoch, scheduler,
             prof["bwd"] += time.perf_counter() - t0
             t0 = time.perf_counter()
         opt.step()
+        # 权重已更新, 量化层的 step 内权重缓存必须立刻失效
+        QL.mark_quant_step()
         if use_prof:
             torch.cuda.synchronize()
             prof["opt"] += time.perf_counter() - t0
@@ -933,7 +939,14 @@ def run_experiment(args, mode):
     steps_per_epoch = len(trainloader)
     _log("DATA", f"train batches={steps_per_epoch} test batches={len(testloader)}")
 
-    model, dummy = build_model(args.model, device, quant_mode=args.quant_mode)
+    # 热身阶段不量化: 全精度模型先练到高精度, 进 joint 再转成量化模型并重建优化器。
+    # 之前是一开始就 model_to_quantize_model, 于是位宽参数在热身期被一起训,
+    # 实测 100 epoch 从 8.23 漂到 4.55 bit —— 等于拿 4-bit 模型从零学, 精度天花板很低。
+    want_quant = args.quant_mode in ("weight_and_activation", "weight_only")
+    warmup = 0 if args.quick_test else args.warmup_epochs
+    defer_quant = want_quant and warmup > 0
+    model, dummy = build_model(args.model, device, quant_mode=args.quant_mode,
+                               quantize=not defer_quant)
     log_dir = os.path.join(args.out, "logs", mode)
     oto, opt = build_optimizer(model, dummy, device, mode, args.epochs, log_dir,
                                variant=args.variant, lr=args.lr,
@@ -943,8 +956,10 @@ def run_experiment(args, mode):
                                projection_periods=args.projection_periods,
                                projection_steps=args.projection_steps,
                                pruning_steps=args.pruning_steps)
+    if defer_quant:
+        _log("QUANT", f"热身 {warmup} epoch 用全精度模型; 进入 joint 时再转量化"
+                      f"({args.quant_mode}) 并按 joint 段重建优化器/调度器")
 
-    warmup = 0 if args.quick_test else args.warmup_epochs
     joint = args.epochs
     # cooldown: 剪枝与位宽下降全部结束后, 固定的压缩结构上只做 finetune。
     # 与 run_daco_cifar10 的 warmup/joint/cooldown 三段调度保持一致。
@@ -1056,6 +1071,35 @@ def run_experiment(args, mode):
         phase = ("warmup" if ep < warmup
                  else "joint" if ep < warmup + joint
                  else "cooldown")
+
+        # 热身 -> joint 的交界: 这一步才把全精度模型转成量化模型, 并按 joint 段
+        # 重建优化器与余弦调度。权重连续、优化器状态从头开始(量化参数本来也不存在)。
+        if defer_quant and ep == warmup and start_ep == 0:
+            from only_train_once.quantization.quant_model import model_to_quantize_model
+            was_training = model.training
+            model = model_to_quantize_model(
+                model, quant_mode=(QuantizationMode.WEIGHT_ONLY
+                                   if args.quant_mode == "weight_only"
+                                   else QuantizationMode.WEIGHT_AND_ACTIVATION))
+            model = model.to(device)
+            model.train(was_training)
+            oto, opt = build_optimizer(model, dummy, device, mode, joint, log_dir,
+                                       variant=args.variant, lr=args.lr,
+                                       lr_quant=args.lr_quant,
+                                       weight_decay=args.weight_decay,
+                                       importance_criteria=args.importance_criteria,
+                                       projection_periods=args.projection_periods,
+                                       projection_steps=args.projection_steps,
+                                       pruning_steps=args.pruning_steps)
+            configure_training_schedule(opt, 0, joint, steps_per_epoch,
+                                        prune_shape=shape,
+                                        prune_floor=getattr(args, "prune_floor", 0.0),
+                                        prune_budget=budget, tag=mode)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=max(joint, 1) * steps_per_epoch, eta_min=eta_min)
+            _log("QUANT", f"{mode} 热身结束 -> 转为量化模型({args.quant_mode}), "
+                          f"优化器与余弦调度按 joint 段重建(权重连续)")
+            defer_quant = False
         # 蒸馏只在 daco 的 joint 段挂载:
         #   baseline 必须保持纯 GETA 才能当对照;
         #   warmup 段还没有"压缩轨迹上的教师", 硬挂等于凭空造教师。
@@ -1065,8 +1109,9 @@ def run_experiment(args, mode):
             runtime = DistillRuntime(
                 DISTILL_CFG, model, criterion, device, args.out,
                 args.model, mode,
-                model_factory=lambda: build_model(
-                    args.model, device, quant_mode=args.quant_mode)[0],
+                model_factory=lambda quantize=True: build_model(
+                    args.model, device, quant_mode=args.quant_mode,
+                    quantize=quantize)[0],
                 val_loader=testloader,
                 log=_log)
             DISTILL_RUNTIME = runtime

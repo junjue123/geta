@@ -1,0 +1,75 @@
+# 诊断 A: 位宽钉死 8-bit, 看 15 epoch 能不能明显高于'学出来的 4.55 bit'
+#
+# 之前的实验起点是 warmup 15 epoch 的 ep15(val 49.6%), 而这个精度下
+# "可靠教师"(更早的热身快照) 只有 43.7%/47.8% —— 比学生更弱, 教师集合
+# 本身就是不合理的输入。第 2 章基线能到 62%, 所以先把起点权重练到位,
+# 再在这个权重上做蒸馏实验与输入体检。
+#
+# 用法: python train.py configs/warmup_100.yaml
+# 产物: outputs/diag_bit8/checkpoints/resnet20_baseline_ep{5,10,...,100}.pt
+
+model: resnet20
+modes: baseline
+quant_mode: weight_and_activation
+
+epochs: 0               # 没有 joint 段 = 不做剪枝, 不降位宽
+warmup_epochs: 15
+seed: 1
+deterministic: false
+lr: 0.001
+lr_eta_min_ratio: 0.01
+variant: adam
+
+dataset:
+  data_dir: datasets/cifar10
+  batch_size: 128
+  num_workers: 4
+  eval_batch_size: 256
+  normalization:
+    mean: [0.4914, 0.4822, 0.4465]
+    std: [0.2023, 0.1994, 0.2010]
+  augmentation:
+    random_crop_padding: 4
+    random_horizontal_flip: true
+
+optimizer:
+  lr_quant: 0.0001
+  weight_decay: 0.0001
+  importance_criteria: default
+  projection_periods: 1
+  projection_steps: 1
+  pruning_steps: 1
+
+prototypes:
+  max_samples: 2000
+
+debug:
+  random_data: false
+  quick_test: false
+  legacy_data: false
+
+out: outputs/diag_bit8
+ckpt_every: 5
+
+prune_shape: linear
+prune_floor: 0.0
+prune_budget: fixed
+
+logging:
+  level: info
+
+compression:
+  target_group_sparsity: 0.0
+  bit_reduction: 0
+  min_bit_wt: 8
+  max_bit_wt: 8
+  min_bit_act: 8
+  max_bit_act: 8
+  phi_b_threshold: 0.9
+  phi_a_threshold: 0.9
+  kappa: 0.5
+  W: 1
+  beta_p: 1.0
+
+distill:
+  enabled: false

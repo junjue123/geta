@@ -58,11 +58,19 @@ def _extract_state(obj):
 
 
 def load_teacher(model_factory, path, device):
-    """用 model_factory 新建一份模型, 灌入 ckpt 权重, 冻结后返回。"""
-    teacher = model_factory()
-    teacher.to(device)
+    """用 model_factory 新建一份模型, 灌入 ckpt 权重, 冻结后返回。
+
+    ckpt 是量化模型还是全精度模型要按内容判断: 热身阶段(现在默认全精度)产出的权重里
+    没有 d_quant/q_m 这些键, 灌进量化模型会当成"缺派生量"被静默忽略, 等于教师没加载。
+    """
     ckpt = torch.load(path, map_location=device, weights_only=False)
     sd = _extract_state(ckpt)
+    needs_quant = any("d_quant" in k for k in sd)
+    try:
+        teacher = model_factory(quantize=needs_quant)
+    except TypeError:                       # 老签名(不接受 quantize 关键字)
+        teacher = model_factory()
+    teacher.to(device)
     missing, unexpected = teacher.load_state_dict(sd, strict=False)
     # 量化模型的 state dict 里带 d_quant_wt/t_quant_wt 这类派生量, 缺几个不算错;
     # 但原生参数缺了就是加载错了, 必须报出来。
