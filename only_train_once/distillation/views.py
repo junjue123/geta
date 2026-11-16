@@ -82,6 +82,19 @@ def _rotate(x, deg, gen):
     return F.grid_sample(x, grid, align_corners=False, padding_mode="zeros")
 
 
+def _rand_flip(x, gen):
+    """逐样本随机水平翻转。
+
+    flip 本身是确定性的, 若同一算子被复制成两个视图(i=2 与 i=7), 两者会完全
+    相同 —— 实测 peer 像素 L1 都是 0.783, 等于组里有两个重复输入。改成逐样本
+    按概率翻转后, 不同视图的翻转子集不同, 组内才有真正的差异。
+    """
+    b = x.shape[0]
+    m = (torch.rand(b, generator=gen) < 0.5)
+    m = m.view(b, 1, 1, 1).to(x.device)
+    return torch.where(m, x.flip(-1), x)
+
+
 def make_views(x, modes, severity="mid", group_size=8, gen=None, seed=None):
     """返回 [(视图名, 张量), ...], 第 0 项永远是 identity(干净视图)。
 
@@ -102,7 +115,7 @@ def make_views(x, modes, severity="mid", group_size=8, gen=None, seed=None):
         if m == "crop":
             ops.append(("crop", lambda t, g: _rand_crop(t, strength["crop"], g)))
         elif m == "flip":
-            ops.append(("flip", lambda t, g: t.flip(-1)))
+            ops.append(("flip", lambda t, g: _rand_flip(t, g)))
         elif m == "color":
             ops.append(("color", lambda t, g: _color_jitter(t, strength["color"], g)))
         elif m == "erase":
@@ -119,8 +132,16 @@ def make_views(x, modes, severity="mid", group_size=8, gen=None, seed=None):
         # 调用方(runtime)会在这种情况下跳过决策层损失并打一次警告。
         return views
     for i in range(1, group_size):
-        name, fn = ops[(i - 1) % len(ops)]
-        views.append((f"{name}{i}", fn(x, gen)))
+        idx = (i - 1) % len(ops)
+        name, fn = ops[idx]
+        t = fn(x, gen)
+        if i - 1 >= len(ops):
+            # 组比算子多时, 第二轮起的副本必须再扰一次, 否则就是"同一个输入
+            # 计两票": 实测 G=8 / 6 个算子时 crop1 与 crop6、flip2 与 flip7
+            # 完全相同, 组内有效视图数只有 6。
+            t = _rotate(t, strength["rotate"] * 0.5, gen)
+            name = f"{name}+rot"
+        views.append((f"{name}{i}", t))
     return views
 
 

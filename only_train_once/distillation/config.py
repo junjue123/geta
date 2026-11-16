@@ -47,7 +47,9 @@ DISTILL_DEFAULTS = {
             "enabled": False,
             "max_count": 2,
             "require_warmup_mid": True,  # 必须含热身中段快照(IB 论断的可证伪点)
-            "coordinate": "compression", # compression | epoch
+            "coordinate": "compression", # compression | epoch_even
+            "weight": "ib",              # ib | uniform
+            "pick": "earliest",          # earliest | mid | end (E4 的 K=1 取样口径)
             "admit_acc_delta": 0.02,     # acc >= acc(theta_t) - delta 才准入
             "weight": "ib",              # ib | uniform
         },
@@ -112,13 +114,18 @@ DISTILL_DEFAULTS = {
             "p_star": 0.9,               # r_eff 阈值
             "every_steps": 50,
         },
+        "jsonl": {                       # 机制体检: 逐 N 步写中间量, 判"机制是否在空转"
+            "enabled": False,
+            "every_steps": 5,
+        },
     },
 }
 
 # 允许的枚举值(校验用)
 ENUMS = {
     "teacher.source": ["trajectory", "none"],
-    "teacher.hist.coordinate": ["compression", "epoch"],
+    "teacher.hist.coordinate": ["compression", "epoch_even"],
+    "teacher.hist.pick": ["earliest", "mid", "end"],
     "teacher.hist.weight": ["ib", "uniform"],
     "teacher.cf.implement": ["shadow", "none"],
     "decision.severity": ["light", "mid", "heavy"],

@@ -136,3 +136,7 @@ distill:
       enabled: true
       p_star: 0.9
       every_steps: 50
+    # 机制体检: 判 D_group / 优势分布 / 逐层偏离量, 而不是只看 val acc
+    jsonl:
+      enabled: true
+      every_steps: 5

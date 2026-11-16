@@ -1005,6 +1005,7 @@ def run_experiment(args, mode):
                 args.model, mode,
                 model_factory=lambda: build_model(
                     args.model, device, quant_mode=args.quant_mode)[0],
+                val_loader=testloader,
                 log=_log)
             DISTILL_RUNTIME = runtime
             _log("DISTILL", f"运行时已挂载于 ep{ep + 1}(joint 起点, 参数锚点即此刻结构)")

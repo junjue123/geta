@@ -12,7 +12,9 @@
   3. 每项损失都可单独归零, 用于"机制缺失对照"(§22 要求机制全保留、只做缺失对照)。
 """
 
+import json
 import math
+import os
 
 import torch
 import torch.nn.functional as F
@@ -92,7 +94,7 @@ class _bn_eval:
 
 class DistillRuntime:
     def __init__(self, cfg, model, criterion, device, out_dir, model_name, mode,
-                 model_factory, log=None):
+                 model_factory, log=None, val_loader=None):
         self.cfg = cfg
         self.model = model
         self.criterion = criterion
@@ -102,7 +104,7 @@ class DistillRuntime:
         self.step = 0
 
         self.pool = TeacherPool(cfg, model, out_dir, model_name, mode, device,
-                                model_factory, log=self.log)
+                                model_factory, log=self.log, val_loader=val_loader)
 
         # 参数层锚点: pre_compression = 挂载时刻(即 joint 段开始的压缩结构)
         self.anchor = {}
@@ -130,6 +132,14 @@ class DistillRuntime:
         self.ramp_steps = int(ramp.get("steps", 0)) if ramp.get("enabled") else 0
         self._ramp_left = 0
         self._prev_skip = None
+
+        # 机制体检: 每一步(或每 N 步)把各机制的中间量写成 JSONL。
+        # 只看 val acc 分不出"机制在空转"和"机制在起作用但被压缩拖住",
+        # 组内退化率 / 优势分布 / 逐层偏离量这些量才是判据。
+        j = (cfg.get("diagnostics") or {}).get("jsonl") or {}
+        self._jsonl_on = bool(j.get("enabled"))
+        self._jsonl_every = max(1, int(j.get("every_steps", 5)))
+        self._diag_path = os.path.join(out_dir, "distill_diag.jsonl")
 
         # 缺 T_hist 时, 依赖它的两项必须真的关掉(不是"算了不报")
         if cfg["feature"]["enabled"] and not self.pool.has_hist:
@@ -264,6 +274,12 @@ class DistillRuntime:
             "r_mean": float(R.mean()),
             "adv_pos": float((adv > 0).float().mean()),
             "view_div": view_diversity(views),
+            # 机制体检用的中间量: 只用精度看不出"组内到底有没有差异",
+            # 这两项直接回答 GRPO 在这一步是不是在空转。
+            "D_group": float((R.min(dim=1).values == R.max(dim=1).values).float().mean()),
+            "adv_std": float(adv.std()) if adv.numel() > 1 else 0.0,
+            "adv_zero": float((adv.abs() < 1e-9).float().mean()),
+            "r_std": float(R.std(dim=1).mean()),
         }
 
         if self.ref_on and self.cfg["decision"]["ref_kl"]["beta"] > 0:
@@ -382,6 +398,9 @@ class DistillRuntime:
             viol = int(over.sum())
             skipped = int((~valid).sum())
             idx = over.nonzero().flatten().tolist()   # 整个投影只在这里同步一次
+            dev = (dn / an)[valid]                    # 逐层偏离量, 机制是否真的在约束就看它
+            dev_mean = float(dev.mean()) if dev.numel() else 0.0
+            dev_max = float(dev.max()) if dev.numel() else 0.0
             if idx:
                 # p + delta*(limit/dn - 1) == a + delta*(limit/dn), 不需要再减一次 a
                 ratios = (limit[idx] / dn[idx]) - 1.0
@@ -392,7 +411,33 @@ class DistillRuntime:
                 clamped = len(idx)
         self._note_event(skipped)
         return {"w_viol": viol, "w_clamped": clamped, "w_skip": skipped,
-                "eps": eps, "prog": float(progress)}
+                "eps": eps, "prog": float(progress),
+                "w_dev_mean": dev_mean, "w_dev_max": dev_max}
+
+    # ---- 机制体检: 中间量落盘 ----
+    def emit_diag(self, epoch, step, stats, extra=None):
+        """每 N 步写一条 JSONL。判"机制是否合理"用的是这里的量, 不是 val acc:
+        组内退化率 D_group 说明 GRPO 有没有在空转; adv_std/adv_zero 说明优势是否
+        塌成常数; w_dev_mean/max 说明参数层约束是真在拉还是在放; 逐层 feat_* 给出
+        层间偏离比; ref_kl 给出压缩后策略漂移。
+        """
+        if not self._jsonl_on:
+            return
+        if step % self._jsonl_every:
+            return
+        rec = {"epoch": epoch, "step": step}
+        rec.update(stats)
+        if extra:
+            rec.update(extra)
+        try:
+            d = os.path.dirname(self._diag_path)
+            if d and not os.path.isdir(d):
+                os.makedirs(d, exist_ok=True)
+            with open(self._diag_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False, default=float) + "\n")
+        except Exception as e:                     # 落盘失败不该拖垮训练
+            self._warn_once("diag_io", f"机制体检 JSONL 写不进去({e}), 已关闭")
+            self._jsonl_on = False
 
     def _warn_once(self, key, msg):
         if key in self._warned:

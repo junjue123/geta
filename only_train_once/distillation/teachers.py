@@ -66,17 +66,37 @@ def load_teacher(model_factory, path, device):
     return teacher
 
 
+@torch.no_grad()
+def quick_acc(model, loader, device, max_batches=None):
+    """教师准入用的快速精度。只跑验证集, 不进梯度, 一次性开销。"""
+    if loader is None:
+        return None
+    was_training = model.training
+    model.eval()
+    c = n = 0
+    for i, (X, y) in enumerate(loader):
+        if max_batches and i >= max_batches:
+            break
+        X, y = X.to(device), y.to(device)
+        c += (model(X).argmax(1) == y).sum().item()
+        n += y.numel()
+    if was_training:
+        model.train()
+    return c / max(n, 1)
+
+
 class TeacherPool:
     """按开关组装教师集合; 缺资源时降级并记录原因, 不静默。"""
 
     def __init__(self, cfg, model, out_dir, model_name, mode, device,
-                 model_factory, log=None):
+                 model_factory, log=None, val_loader=None):
         self.cfg = cfg
         self.device = device
         self.hist = []          # [(epoch, model)]
         self.cf = None
         self.notes = []
         self._log = log or (lambda tag, msg: None)
+        self.val_loader = val_loader
 
         t = cfg["teacher"]
         self._build_hist(t["hist"], out_dir, model_name, mode, model_factory)
@@ -95,7 +115,9 @@ class TeacherPool:
             return
 
         k = max(1, int(hcfg["max_count"]))
-        picked = self._select(cands, k, hcfg["require_warmup_mid"])
+        picked = self._select(cands, k, hcfg["require_warmup_mid"],
+                              hcfg.get("coordinate", "compression"),
+                              hcfg.get("pick", "earliest"))
         for ep, path in picked:
             try:
                 m = load_teacher(model_factory, path, self.device)
@@ -103,20 +125,56 @@ class TeacherPool:
             except Exception as e:                      # 单个坏 ckpt 不该拖垮整次训练
                 self._log("DISTILL", f"教师 ep{ep} 加载失败, 跳过: {e}")
         if self.hist:
+            delta = float(hcfg.get("admit_acc_delta", 0.0))
+            # 准入判据: 教师精度不得低于学生太多。实测学生 ep15 val 49.57%,
+            # 而 ep5/ep10 只有 43.74%/47.78% —— 两个"可靠教师"其实都比学生弱
+            # 5.8/1.8 pt, 拿它们的软标签与特征锚去拽学生, 方向是错的。
+            if self.val_loader is not None and delta > 0:
+                s_acc = quick_acc(self.model, self.val_loader, self.device)
+                kept = []
+                for ep, m in self.hist:
+                    t_acc = quick_acc(m, self.val_loader, self.device)
+                    if t_acc is not None and t_acc >= s_acc - delta:
+                        kept.append((ep, m))
+                        self._log("DISTILL",
+                                  f"教师 ep{ep} 准入通过: acc {t_acc:.4f} "
+                                  f"(学生 {s_acc:.4f}, 容差 {delta})")
+                    else:
+                        self._log("DISTILL",
+                                  f"教师 ep{ep} 准入被拒: acc {t_acc:.4f} < "
+                                  f"学生 {s_acc:.4f} - {delta}")
+                self.hist = kept
             eps = [e for e, _ in self.hist]
-            self.notes.append(f"T_hist 就绪: {len(self.hist)} 个(ep={eps})")
+            if self.hist:
+                self.notes.append(f"T_hist 就绪: {len(self.hist)} 个(ep={eps})")
+            else:
+                self.notes.append(
+                    "T_hist 全部被准入判据拒绝(教师都比学生弱), 依赖它的特征层与 "
+                    "ref 位本次自动关闭")
             self._log("DISTILL", self.notes[-1])
 
     @staticmethod
-    def _select(cands, k, require_mid):
-        """选"压缩最少、最可靠"的几个: 优先最早 epoch; 需要中段时再补一个中位。"""
-        eps = [e for e, _ in cands]
-        chosen = [cands[0]]
+    def _select(cands, k, require_mid, coordinate="compression", pick="earliest"):
+        """选教师快照。E4 要比较三种坐标口径, 所以这里把"怎么排序"和"从哪起选"
+        分开: coordinate 决定间距口径, pick 决定锚点是整条轨迹的哪一端。
+        """
+        if coordinate == "epoch_even" and k > 1:
+            # 按 epoch 等距取点(含首尾): 与"压缩更少优先"的口径做对照
+            n = len(cands)
+            idxs = sorted({int(round(i * (n - 1) / (k - 1))) for i in range(k)})
+            chosen = [cands[i] for i in idxs]
+            if cands[-1] not in chosen:
+                chosen.append(cands[-1])
+            return chosen[:k]
+
+        anchor = {"earliest": 0, "mid": len(cands) // 2,
+                  "end": len(cands) - 1}.get(pick, 0)
+        chosen = [cands[anchor]]
         if k >= 2 and require_mid and len(cands) > 1:
             mid = cands[len(cands) // 2]
             if mid[0] != chosen[0][0]:
                 chosen.append(mid)
-        for c in cands[1:]:
+        for c in cands:
             if len(chosen) >= k:
                 break
             if c[0] not in [x[0] for x in chosen]:

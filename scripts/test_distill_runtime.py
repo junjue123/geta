@@ -229,6 +229,38 @@ def main():
     assert rt_ramp._ramp_scale() == 1.0
     print("  [ok] 事件前 1.0 / 事件后第 2 步 0.2 / 升满后 1.0")
 
+    print("\nT13 教师取样口径: E4 要比 K 与坐标, pick/coordinate 必须真的改变选到谁")
+    import only_train_once.distillation.teachers as _tch
+    cands = [(5, "p5"), (10, "p10"), (15, "p15"), (20, "p20"), (25, "p25"),
+             (30, "p30"), (35, "p35")]
+    s = _tch.TeacherPool._select
+    assert [e for e, _ in s(cands, 2, True, "compression", "earliest")] == [5, 20]
+    assert [e for e, _ in s(cands, 1, True, "compression", "mid")] == [20]
+    assert [e for e, _ in s(cands, 1, True, "compression", "end")] == [35]
+    assert [e for e, _ in s(cands, 2, True, "compression", "end")] == [35, 20]
+    assert [e for e, _ in s(cands, 3, True, "compression", "earliest")] == [5, 20, 10]
+    # epoch 等距: 含首尾铺开, 且必须真的和"压缩更少优先"取到不同的集合
+    ev = [e for e, _ in s(cands, 2, False, "epoch_even", "earliest")]
+    assert ev == [5, 35], ev
+    ev3 = [e for e, _ in s(cands, 3, False, "epoch_even", "earliest")]
+    assert ev3 == [5, 20, 35], ev3
+    assert len({tuple(ev), tuple([e for e, _ in s(cands, 2, False)])}) == 2
+    print("  [ok] earliest/mid/end/epoch_even 四种口径分别取到不同快照")
+
+    print("\nT14 视图组不许有重复输入: G=8 而算子只有 6 个时, 副本必须真的不同")
+    import only_train_once.distillation.views as _vw
+    xv = torch.randn(4, 3, 32, 32)
+    views = _vw.make_views(xv, ["identity", "crop", "flip", "color", "cutout", "rotate"],
+                           "mid", group_size=8, seed=1)
+    assert len(views) == 8, len(views)
+    for i in range(1, len(views)):
+        for j in range(i + 1, len(views)):
+            assert not torch.allclose(views[i][1], views[j][1]), \
+                f"{views[i][0]} 与 {views[j][0]} 是同一个输入(组里重复计票)"
+    flips = [float((v - xv).abs().mean()) for n, v in views if n.startswith("flip")]
+    assert len(flips) == 2 and abs(flips[0] - flips[1]) > 1e-6, flips
+    print(f"  [ok] 8 个视图两两不同, flip 副本 L1={flips[0]:.3f}/{flips[1]:.3f}")
+
     print("\n[ok] 运行时单元测试全部通过")
 
 
