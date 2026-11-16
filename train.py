@@ -1153,6 +1153,14 @@ _YAML_TO_ARG = {
     "importance_criteria": "importance_criteria",
     "projection_periods": "projection_periods",
     "projection_steps": "projection_steps", "pruning_steps": "pruning_steps",
+    # 续训: 允许写在 yaml 里, 这样"起一个实验=改 yaml"成立(命令行 --resume-from 优先级更高)
+    "resume_from": "resume_from", "resume": "resume",
+}
+
+# yaml 里允许出现但不是顶层标量的块
+_YAML_BLOCKS = {
+    "dataset", "optimizer", "prototypes", "debug", "logging",
+    "compression", "distill", "distill_overrides", "baseline_override",
 }
 
 
@@ -1230,6 +1238,11 @@ def _apply_config(p):
         if dbg.get(k) is not None:
             defaults[k] = bool(dbg[k])
 
+    # 未识别的顶层键会被静默忽略(历史坑: resume_from 曾写在 yaml 里没生效), 这里显式点名
+    unknown = [k for k in cfg if k not in _YAML_TO_ARG and k not in _YAML_BLOCKS]
+    if unknown:
+        _log("CONFIG", f"[WARN] {cfg_path} 有未识别的顶层键, 已忽略: {sorted(unknown)}")
+
     p.set_defaults(**defaults)
 
     comp = cfg.get("compression") or {}
@@ -1238,6 +1251,9 @@ def _apply_config(p):
         if k in PAPER_DEFAULTS and v is not None:
             PAPER_DEFAULTS[k] = v
             applied[k] = v
+    comp_unknown = [k for k in comp if k not in PAPER_DEFAULTS]
+    if comp_unknown:
+        _log("CONFIG", f"[WARN] compression 块有未识别的键, 已忽略: {sorted(comp_unknown)}")
 
     # baseline 的覆盖项也可写进 yaml, 保证"纯 GETA"的关断配置有记录
     bo = cfg.get("baseline_override") or {}
