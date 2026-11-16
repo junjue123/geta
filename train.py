@@ -88,7 +88,6 @@ from torch.utils.data import DataLoader
 from only_train_once import OTO
 from only_train_once.quantization.quant_model import model_to_quantize_model
 from only_train_once.quantization.quant_layers import QuantizationMode
-from only_train_once.quantization import quant_layers as QL
 
 
 def _resolve_data_dir(p):
@@ -651,8 +650,6 @@ def train_one_epoch(model, opt, loader, criterion, device, epoch, scheduler,
             prof["bwd"] += time.perf_counter() - t0
             t0 = time.perf_counter()
         opt.step()
-        # 权重已更新, 量化层的 step 内权重缓存必须立刻失效
-        QL.mark_quant_step()
         if use_prof:
             torch.cuda.synchronize()
             prof["opt"] += time.perf_counter() - t0
@@ -944,7 +941,22 @@ def run_experiment(args, mode):
     # 实测 100 epoch 从 8.23 漂到 4.55 bit —— 等于拿 4-bit 模型从零学, 精度天花板很低。
     want_quant = args.quant_mode in ("weight_and_activation", "weight_only")
     warmup = 0 if args.quick_test else args.warmup_epochs
-    defer_quant = want_quant and warmup > 0
+    # 起点是"热身阶段产出的全精度权重"时, 也要走 defer: 先把 FP32 权重灌进全精度模型,
+    # 进 joint 那一刻再转量化。否则 FP32 权重里的 q_m_wt/d_quant 全是初始化值,
+    # 等于用一个位宽乱定的量化模型接手高精度起点(还缺少跨层量化统计)。
+    init_path_peek = getattr(args, "init_from", None)
+    init_is_fp32 = False
+    if init_path_peek and os.path.exists(init_path_peek):
+        try:
+            _sd = torch.load(init_path_peek, map_location="cpu", weights_only=False)
+            for _k in ("model", "model_state_dict", "state_dict"):
+                if isinstance(_sd, dict) and isinstance(_sd.get(_k), dict):
+                    _sd = _sd[_k]
+                    break
+            init_is_fp32 = not any("d_quant" in str(k) for k in _sd.keys())
+        except Exception:                        # 读不动就让下面的加载逻辑报错
+            init_is_fp32 = False
+    defer_quant = want_quant and (warmup > 0 or init_is_fp32)
     model, dummy = build_model(args.model, device, quant_mode=args.quant_mode,
                                quantize=not defer_quant)
     log_dir = os.path.join(args.out, "logs", mode)
@@ -957,8 +969,12 @@ def run_experiment(args, mode):
                                projection_steps=args.projection_steps,
                                pruning_steps=args.pruning_steps)
     if defer_quant:
-        _log("QUANT", f"热身 {warmup} epoch 用全精度模型; 进入 joint 时再转量化"
-                      f"({args.quant_mode}) 并按 joint 段重建优化器/调度器")
+        if warmup > 0:
+            _log("QUANT", f"热身 {warmup} epoch 用全精度模型; 进入 joint 时再转量化"
+                          f"({args.quant_mode}) 并按 joint 段重建优化器/调度器")
+        else:
+            _log("QUANT", f"起点是全精度权重({os.path.basename(init_path_peek)}): 先按 FP32 加载, "
+                          f"joint 第 1 步前再转量化({args.quant_mode}) 并按 joint 段重建优化器/调度器")
 
     joint = args.epochs
     # cooldown: 剪枝与位宽下降全部结束后, 固定的压缩结构上只做 finetune。
@@ -1049,7 +1065,10 @@ def run_experiment(args, mode):
                     sd = sd[k]
                     break
         missing, unexpected = model.load_state_dict(sd, strict=False)
-        fatal = [k for k in missing if "quant" not in k and "scale" not in k]
+        # 量化派生量(d_quant/q_m_*/t_quant_*/scale)不参与"权重是否对得上"的判断:
+        # 它们在量化层里由 bit 宽度重新初始化, 真正的权重是 conv/bn/fc 那些。
+        fatal = [k for k in missing
+                 if not any(t in k for t in ("quant", "q_m", "d_quant", "t_quant", "scale"))]
         if fatal:
             raise SystemExit(f"[INIT] {init_path} 权重对不上, 缺关键参数: {fatal[:6]}")
         _log("INIT", f"{mode} 只用 {init_path} 的权重起步(epoch 从 0 重数, "

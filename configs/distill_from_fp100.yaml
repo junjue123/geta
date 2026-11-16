@@ -1,0 +1,144 @@
+# 从全精度高精度起点(热身 100 epoch, val 89.68%)做压缩+蒸馏
+# 起点是 FP32 权重(无 d_quant 键): 教师加载端按 ckpt 内容自适应建全精度模型。
+# 本配置 warmup_epochs=0, 量化从 joint 第 1 步起生效 = 只在 joint 阶段量化+剪枝。
+
+# 从高精度起点(热身 100 epoch)做压缩+蒸馏
+#
+# 与 distill_daco_gradual.yaml 的区别只在起点与教师来源:
+#   · 起点 = outputs/warmup_fp/checkpoints/resnet20_baseline_ep100.pt (约 62%)
+#   · 教师 = 同一目录里的高精度快照(ep95/ep90), 它们**没有经过任何压缩**,
+#     所以 joint 段学生被剪掉 40% 之后, 教师确实比学生强 —— 这才是
+#     "压缩更少、更可靠" 的教师应该来自哪里(先前取热身早期快照, 只有 43%).
+#
+# 用法: python train.py configs/distill_from100.yaml
+#   (权重来源写在 init_from: 只灌权重, epoch 从 0 重数, 15 期压缩调度从头开始。
+#    不要用 --resume-from —— 那会把起点设成 ep100, 而总 epoch 只有 15, 循环会空转。)
+
+model: resnet20
+modes: daco
+quant_mode: weight_and_activation
+
+init_from: outputs/warmup_fp/checkpoints/resnet20_baseline_ep100.pt
+epochs: 15             # joint; 只为验证蒸馏方法, 不追第2章的 100 epoch 规模
+warmup_epochs: 0
+seed: 1
+deterministic: false
+lr: 0.001
+lr_eta_min_ratio: 0.01
+variant: adam
+
+dataset:
+  data_dir: datasets/cifar10
+  batch_size: 128
+  num_workers: 4
+  eval_batch_size: 256
+  normalization:
+    mean: [0.4914, 0.4822, 0.4465]
+    std: [0.2023, 0.1994, 0.2010]
+  augmentation:
+    random_crop_padding: 4
+    random_horizontal_flip: true
+
+optimizer:
+  lr_quant: 0.001
+  weight_decay: 0.0001
+  importance_criteria: default
+  projection_periods: 1
+  projection_steps: 1
+  pruning_steps: 1
+
+prototypes:
+  max_samples: 2000
+
+debug:
+  random_data: false
+  quick_test: false
+  legacy_data: false
+
+out: outputs/distill_from_fp100
+ckpt_every: 5
+
+prune_shape: cosine
+prune_floor: 0.0
+prune_budget: fixed
+
+logging:
+  level: info
+
+compression:
+  target_group_sparsity: 0.3   # 压到 50% 时 5~10 期就塌成随机, 先压到 30% 保证学生还活着
+  bit_reduction: 1
+  min_bit_wt: 4
+  max_bit_wt: 16
+  min_bit_act: 2
+  max_bit_act: 16
+  phi_b_threshold: 0.9
+  phi_a_threshold: 0.9
+  kappa: 0.5
+  W: 15                  # 15 期, 每期约 4 组
+  beta_p: 1.0
+
+distill:
+  enabled: true
+
+  teacher:
+    source: trajectory
+    hist:
+      enabled: true
+      max_count: 2
+      require_warmup_mid: false
+      coordinate: compression
+      pick: end                  # 取最近的快照 = 压缩最少 = 精度最高
+      source_dir: outputs/warmup_fp          # 跨目录取教师
+      source_mode: baseline                   # 那边的 ckpt 前缀是 resnet20_baseline_ep*
+      admit_acc_delta: 0.02
+      weight: ib
+    cf:
+      enabled: true
+      implement: shadow
+      views: 2
+
+  decision:
+    enabled: true
+    group_size: 8
+    augment_modes: [identity, crop, flip, color, cutout, rotate]
+    severity: mid
+    reward:
+      correctness: true
+      teacher_agreement: 1.0
+      clean_consistency: 0.5
+    advantage:
+      normalize_std: false
+      mode: positive
+    ref_kl:
+      enabled: true
+      beta: 0.03
+      views: clean
+
+  feature:
+    enabled: true
+    taps: [layer2, layer3]
+    pick: fixed
+    divergence: forward
+    budget: sensitivity
+    alpha: 1.0
+
+  weight:
+    enabled: true
+    epsilon0: 0.01
+    kappa: 1.0
+    schedule: tighten
+    anchor: pre_compression
+
+  ramp:
+    enabled: true
+    steps: 20
+
+  diagnostics:
+    effective_rank:
+      enabled: true
+      p_star: 0.9
+      every_steps: 50
+    jsonl:
+      enabled: true
+      every_steps: 5
