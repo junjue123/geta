@@ -385,6 +385,8 @@ def get_dataloaders(data_dir, batch_size=128, num_workers=4, seed=1,
     trainloader = DataLoader(trainset, batch_size=batch_size, shuffle=True,
                              num_workers=num_workers, pin_memory=True,
                              drop_last=True, worker_init_fn=_seed_worker,
+                             persistent_workers=num_workers > 0,
+                             prefetch_factor=4 if num_workers > 0 else None,
                              generator=g)
     testloader = DataLoader(testset, batch_size=eval_batch_size, shuffle=False,
                             num_workers=num_workers, pin_memory=True,

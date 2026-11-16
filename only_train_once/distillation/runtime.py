@@ -109,10 +109,15 @@ class DistillRuntime:
         if cfg["weight"]["enabled"]:
             self.anchor = {n: p.detach().clone()
                            for n, p in model.named_parameters() if p.numel() > 0}
-            # 锚点全程不变, 范数与非零个数只需算一次: 投影每步都在为 197 个张量
-            # 重算 a.norm() 与 (a != 0).sum(), 实测 opt+proj 段能占到单步 20%。
-            self._anchor_norm = {n: float(a.norm()) for n, a in self.anchor.items()}
-            self._anchor_nnz = {n: int((a != 0).sum()) for n, a in self.anchor.items()}
+            # 投影每步都要核对 197 个张量。逐个张量调 .norm().item() / .sum().item()
+            # 等于每步 394 次 GPU 同步, 实测 proj 段与 batch 无关地恒定 53 ms/step
+            # (B=128 与 B=256 都是 53 ms)。改成: 锚点侧算一次存成张量, 每步用
+            # _foreach_norm / stack 批量算, 只留一次 .tolist() 取值。
+            self._pairs = [(p, self.anchor[n]) for n, p in model.named_parameters()
+                           if n in self.anchor and p.numel() > 0]
+            self._anchor_norm_t = torch.stack([a.norm() for _, a in self._pairs])
+            self._anchor_nnz_t = torch.stack(
+                [torch.count_nonzero(a).double() for _, a in self._pairs])
             self.log("DISTILL", f"参数层锚点已冻结: {len(self.anchor)} 个张量; "
                                 f"ε0={cfg['weight']['epsilon0']} "
                                 f"schedule={cfg['weight']['schedule']}")
@@ -363,23 +368,28 @@ class DistillRuntime:
 
         viol, clamped, skipped = 0, 0, 0
         with torch.no_grad():
-            for n, p in self.model.named_parameters():
-                a = self.anchor.get(n)
-                if a is None or p.numel() == 0 or a.norm() == 0:
-                    continue
-                # 结构变了(剪枝把某些通道置零)就跳过: 此时"偏离"是剪枝造成的,
-                # 不是训练漂移, 投影它等于把剪枝撤销。实测在 joint 段每步会
-                # 误伤 43 个张量, 所以这条判据是必需的, 不是可选优化。
-                if int((p.data != 0).sum()) != int((a != 0).sum()):
-                    skipped += 1
-                    continue
-                delta = p.data - a
-                dn = delta.norm()
-                limit = eps * a.norm()
-                viol += int(dn > limit)
-                if dn > limit:
-                    p.data.copy_(a + delta * (limit / dn))
-                    clamped += 1
+            pairs = self._pairs
+            deltas = [p.data - a for p, a in pairs]
+            dn = torch.stack(torch._foreach_norm(deltas, 2.0))
+            nnz_now = torch.stack([torch.count_nonzero(p.data).double() for p, _ in pairs])
+            an = self._anchor_norm_t
+            # 结构变了(剪枝把某些通道置零)就跳过: 此时"偏离"是剪枝造成的,
+            # 不是训练漂移, 投影它等于把剪枝撤销。实测在 joint 段每步会
+            # 误伤 43 个张量, 所以这条判据是必需的, 不是可选优化。
+            valid = (an > 0) & (nnz_now == self._anchor_nnz_t)
+            limit = eps * an
+            over = valid & (dn > limit)
+            viol = int(over.sum())
+            skipped = int((~valid).sum())
+            idx = over.nonzero().flatten().tolist()   # 整个投影只在这里同步一次
+            if idx:
+                # p + delta*(limit/dn - 1) == a + delta*(limit/dn), 不需要再减一次 a
+                ratios = (limit[idx] / dn[idx]) - 1.0
+                sub_deltas = [deltas[i] for i in idx]
+                sub_params = [pairs[i][0].data for i in idx]
+                torch._foreach_mul_(sub_deltas, ratios.unbind())
+                torch._foreach_add_(sub_params, sub_deltas)
+                clamped = len(idx)
         self._note_event(skipped)
         return {"w_viol": viol, "w_clamped": clamped, "w_skip": skipped,
                 "eps": eps, "prog": float(progress)}
