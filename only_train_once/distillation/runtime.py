@@ -113,6 +113,15 @@ class DistillRuntime:
                                 f"ε0={cfg['weight']['epsilon0']} "
                                 f"schedule={cfg['weight']['schedule']}")
 
+        # 压缩事件后的蒸馏强度缓升。实测(ep17 step0, 第 2 期剪枝刚做完):
+        # ref_kl 0.18->0.49、feat_layer3 0.10->0.65、dec 0.55->0.97、r_mean 1.5->0.34,
+        # 同期 loss 3.23 / acc 0.25 —— 剪枝瞬间学生分布离教师极远, 一步到位的
+        # 强约束等于用旧权重的分布硬拽刚剪完的模型, 会把恢复过程打乱。
+        ramp = cfg.get("ramp") or {}
+        self.ramp_steps = int(ramp.get("steps", 0)) if ramp.get("enabled") else 0
+        self._ramp_left = 0
+        self._prev_skip = None
+
         # 缺 T_hist 时, 依赖它的两项必须真的关掉(不是"算了不报")
         if cfg["feature"]["enabled"] and not self.pool.has_hist:
             self.feature_on = False
@@ -150,7 +159,34 @@ class DistillRuntime:
         # 视图的随机种子跟着 step 走: 种子恒定时每步生成的是同一批视图,
         # 组内多样性会退化成"只有一张图", 优势也跟着退化。
         self.step += 1
+
+        # 压缩事件后的强度缓升: 0 -> 1 线性升满 ramp_steps 步
+        scale = self._ramp_scale()
+        if scale < 1.0 and total is not None:
+            total = total * scale
+            stats["ramp"] = scale
+        if self._ramp_left > 0:
+            self._ramp_left -= 1
         return total, stats
+
+    def _ramp_scale(self):
+        """当前蒸馏强度系数; 非事件期恒 1.0。"""
+        if self.ramp_steps <= 0 or self._ramp_left <= 0:
+            return 1.0
+        return max(0.0, 1.0 - self._ramp_left / float(self.ramp_steps))
+
+    def _note_event(self, skipped):
+        """用 w_skip 的增长探测压缩事件(支撑集变了 == 刚剪过)。"""
+        if self.ramp_steps <= 0:
+            return
+        prev = self._prev_skip
+        self._prev_skip = skipped
+        if prev is None:
+            return
+        if skipped > prev:
+            self._ramp_left = self.ramp_steps
+            self.log("DISTILL", f"检测到压缩事件(w_skip {prev}->{skipped}), "
+                                f"蒸馏强度按 {self.ramp_steps} 步缓升")
 
     # ---- 决策层: GRPO 组内优势 ----
     def _decision_loss(self, X, y, clean_logits):
@@ -317,6 +353,8 @@ class DistillRuntime:
         eps = w["epsilon0"]
         if w["schedule"] == "tighten":
             kappa = max(float(w["kappa"]), 1e-6)
+            # κ=1.0 时 κ^-progress 恒为 1, 收紧等于没开; 日志里把 eps 与 progress
+            # 一起打出来, 就是为了让"有没有真的收紧"在日志里可验证。
             eps = w["epsilon0"] * (kappa ** -float(progress))
 
         viol, clamped, skipped = 0, 0, 0
@@ -338,7 +376,9 @@ class DistillRuntime:
                 if dn > limit:
                     p.data.copy_(a + delta * (limit / dn))
                     clamped += 1
-        return {"w_viol": viol, "w_clamped": clamped, "w_skip": skipped, "eps": eps}
+        self._note_event(skipped)
+        return {"w_viol": viol, "w_clamped": clamped, "w_skip": skipped,
+                "eps": eps, "prog": float(progress)}
 
     def _warn_once(self, key, msg):
         if key in self._warned:

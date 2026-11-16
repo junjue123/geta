@@ -99,6 +99,12 @@ DISTILL_DEFAULTS = {
         "anchor": "pre_compression",     # pre_compression | init
     },
 
+    # ---------------- 压缩事件后的强度缓升 ----------------
+    "ramp": {
+        "enabled": False,                # 与其余机制一致: 默认全关
+        "steps": 20,                     # 剪枝后 N 步内 0->1 线性升(实测事件处 KL 涨 3~6 倍)
+    },
+
     # ---------------- 诊断(只读) ----------------
     "diagnostics": {
         "effective_rank": {              # I5: 用有效秩判压缩是否该停
@@ -264,6 +270,8 @@ def validate(cfg):
         raise DistillConfigError("weight.epsilon0 应在 (0, 1]")
     if flat["weight.kappa"] < 0:
         raise DistillConfigError("weight.kappa 应 >= 0")
+    if not (0 <= flat["ramp.steps"] <= 200):
+        raise DistillConfigError("ramp.steps 应在 [0, 200]")
     if not (0.0 < flat["diagnostics.effective_rank.p_star"] < 1.0):
         raise DistillConfigError("diagnostics.effective_rank.p_star 应在 (0,1)")
 
@@ -314,6 +322,13 @@ def collect_warnings(cfg):
                   and not k.startswith("diagnostics.")]
         if minors:
             out.append(f"distill.enabled=false, 以下子开关不会生效: {minors}")
+    if (cfg["weight"]["enabled"] and cfg["weight"]["schedule"] == "tighten"
+            and float(cfg["weight"]["kappa"]) <= 1.0 + 1e-9):
+        out.append("weight.schedule=tighten 但 kappa<=1.0: "
+                   "eps = eps0 * kappa^-progress 恒等于 eps0, 收紧实际没生效")
+    if cfg["ramp"]["enabled"] and not cfg["weight"]["enabled"]:
+        out.append("ramp 靠 weight 层的 w_skip 探测压缩事件, 但 weight.enabled=false "
+                   "-> 探测不到事件, 缓升不会触发")
     return out
 
 
@@ -395,6 +410,9 @@ def summary_lines(cfg):
     if w["enabled"]:
         lines.append(f"  参数: ε0={w['epsilon0']} κ={w['kappa']} "
                      f"{w['schedule']} anchor={w['anchor']}")
+    r = cfg.get("ramp") or {}
+    if r.get("enabled"):
+        lines.append(f"  压缩事件后缓升: {r['steps']} 步")
     if cfg["diagnostics"]["effective_rank"]["enabled"]:
         e = cfg["diagnostics"]["effective_rank"]
         lines.append(f"  I5: p*={e['p_star']} every={e['every_steps']} steps")

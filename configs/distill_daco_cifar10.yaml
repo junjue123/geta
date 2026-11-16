@@ -125,6 +125,12 @@ distill:
     schedule: tighten
     anchor: pre_compression
 
+  # 剪枝事件后蒸馏强度 0->1 线性升. 实测事件处理(ep17 step0)三项 KL 同时涨
+  # 3~6 倍(ref_kl 0.18->0.49, feat_layer3 0.10->0.65), 一步到位会把恢复打乱.
+  ramp:
+    enabled: true
+    steps: 20
+
   diagnostics:
     effective_rank:
       enabled: true

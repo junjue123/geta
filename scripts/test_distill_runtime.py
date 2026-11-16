@@ -213,6 +213,22 @@ def main():
     assert "feat_layer3" in fs2 and "feat_avg_pool" not in fs2, fs2
     print(f"  [ok] 去重后只剩 {list(fs2.keys())}, 未把同一个量计两次")
 
+    print("\nT12 压缩事件后强度缓升: 事件后从 0 线性升到 1, 非事件期恒 1")
+    cfg_ramp = DC.resolve({"enabled": True, "ramp": {"enabled": True, "steps": 10},
+                           "weight": {"enabled": False}})
+    rt_ramp = DistillRuntime(cfg_ramp, model, torch.nn.CrossEntropyLoss(),
+                             torch.device("cpu"), str(ROOT / "no_such_dir"),
+                             "resnet20", "daco",
+                             lambda: build_model("resnet20", torch.device("cpu"))[0])
+    assert rt_ramp._ramp_scale() == 1.0
+    rt_ramp._note_event(3)
+    rt_ramp._note_event(9)                     # skip 增长 == 刚剪过
+    rt_ramp._ramp_left = 8
+    assert abs(rt_ramp._ramp_scale() - 0.2) < 1e-9
+    rt_ramp._ramp_left = 0
+    assert rt_ramp._ramp_scale() == 1.0
+    print("  [ok] 事件前 1.0 / 事件后第 2 步 0.2 / 升满后 1.0")
+
     print("\n[ok] 运行时单元测试全部通过")
 
 
