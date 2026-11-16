@@ -589,31 +589,67 @@ def train_one_epoch(model, opt, loader, criterion, device, epoch, scheduler,
     """单个 epoch。runtime 只在 joint 段生效(压缩进行中才有"教师"可谈)。"""
     model.train()
     total_loss, correct, total = 0.0, 0, 0
+    # 分项计时: GETA_PROFILE=1 时每 100 步打一行, 用来看清"耗时到底花在哪"。
+    # 只在显式开启时同步 CUDA, 否则不付这个代价。
+    use_prof = os.environ.get("GETA_PROFILE") == "1"
+    prof = {k: 0.0 for k in ("data", "fwd", "extra", "bwd", "opt", "proj")}
+    t_last = time.perf_counter()
     for bi, (X, y) in enumerate(loader):
+        if use_prof:
+            prof["data"] += time.perf_counter() - t_last
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
         X, y = X.to(device), y.to(device)
         out = model(X)
         loss = criterion(out, y)
         stats = {}
+        if use_prof:
+            torch.cuda.synchronize()
+            prof["fwd"] += time.perf_counter() - t0
+            t0 = time.perf_counter()
         if runtime is not None:
             # 三项里只有 decision/feature 是损失; weight 在 opt.step() 之后做投影。
             # 传带梯度的 out(而不是 detach), 让 ref 位复用主前向, 少跑一遍学生前向。
             extra, stats = runtime.extra_loss(X, y, out)
             if extra is not None:
                 loss = loss + extra
+        if use_prof:
+            torch.cuda.synchronize()
+            prof["extra"] += time.perf_counter() - t0
+            t0 = time.perf_counter()
         opt.zero_grad()
         loss.backward()
+        if use_prof:
+            torch.cuda.synchronize()
+            prof["bwd"] += time.perf_counter() - t0
+            t0 = time.perf_counter()
         opt.step()
         if runtime is not None:
             # 必须在 step 之后: 先让优化器走一步, 再拉回 ε-球内, 顺序反了就等于没约束
             stats.update(runtime.project_weights(progress))
+        if use_prof:
+            torch.cuda.synchronize()
+            prof["opt"] += time.perf_counter() - t0
+            t0 = time.perf_counter()
         if scheduler is not None:
             scheduler.step()
         total_loss += loss.item() * X.size(0)
         correct += (out.argmax(1) == y).sum().item()
         total += X.size(0)
+        if use_prof:
+            torch.cuda.synchronize()
+            prof["proj"] += time.perf_counter() - t0
+            t_last = time.perf_counter()
         if bi % 100 == 0:
             print(f"    Ep{epoch} [{bi}/{len(loader)}] loss={loss.item():.4f} "
                   f"acc={correct/total:.4f}", flush=True)
+            if use_prof:
+                n = bi / 100.0 if bi else 1
+                print("    [PROF] ms/step " + " ".join(
+                    f"{k}={v*1000/max(bi,1):.0f}" if bi else f"{k}={v*1000:.0f}"
+                    for k, v in prof.items()), flush=True)
+                for k in prof:
+                    prof[k] = 0.0
             if stats:
                 _log("DISTILL", f"ep{epoch} step{bi} " + " ".join(
                     f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
