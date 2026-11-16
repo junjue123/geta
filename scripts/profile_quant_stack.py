@@ -28,13 +28,13 @@ def main(batch=128):
     y = torch.randint(0, 10, (batch,), device=dev)
 
     for _ in range(2):
-        opt.zero_grad(); crit(model(x), y).backward(); opt.step(); QL.mark_quant_step()
+        opt.zero_grad(); crit(model(x), y).backward(); opt.step()
     torch.cuda.synchronize()
 
     from torch.profiler import profile, ProfilerActivity
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
                  with_stack=True, record_shapes=False) as prof:
-        opt.zero_grad(); crit(model(x), y).backward(); opt.step(); QL.mark_quant_step()
+        opt.zero_grad(); crit(model(x), y).backward(); opt.step()
         torch.cuda.synchronize()
 
     # key_averages(with_stack=True) 才能拿到 stack 列表

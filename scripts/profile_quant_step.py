@@ -33,14 +33,14 @@ def main(batch=128, steps=3, top=14):
     y = torch.randint(0, 10, (batch,), device=dev)
 
     for _ in range(3):
-        opt.zero_grad(); crit(model(x), y).backward(); opt.step(); QL.mark_quant_step()
+        opt.zero_grad(); crit(model(x), y).backward(); opt.step()
     torch.cuda.synchronize()
 
     from torch.profiler import profile, ProfilerActivity
     # torch 2.1 的 kineto 后端要求同时开 CPU activity, 否则 "Legacy CUDA profiling" 断言失败
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         for _ in range(steps):
-            opt.zero_grad(); crit(model(x), y).backward(); opt.step(); QL.mark_quant_step()
+            opt.zero_grad(); crit(model(x), y).backward(); opt.step()
         torch.cuda.synchronize()
 
     rows = []
