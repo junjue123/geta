@@ -928,13 +928,21 @@ def run_experiment(args, mode):
     os.makedirs(ckpt_dir, exist_ok=True)
     latest_ckpt = os.path.join(ckpt_dir, f"{args.model}_{mode}_latest.pt")
     start_ep = 0
-    if getattr(args, "resume", False) and os.path.exists(latest_ckpt):
-        start_ep = _resume_from(latest_ckpt, model, opt, scheduler,
+    # --resume-from 优先: 允许从任意快照(例如 warmup 结束的 ep15)续训,
+    # 而不是只能从 latest 恢复 —— 改代码后想复用已完成的前段时必须这个。
+    resume_path = getattr(args, "resume_from", None)
+    if resume_path and not os.path.exists(resume_path):
+        _log("RESUME", f"{mode} 指定的 {resume_path} 不存在, 从头开始")
+        resume_path = None
+    if resume_path is None and getattr(args, "resume", False):
+        resume_path = latest_ckpt if os.path.exists(latest_ckpt) else None
+        if resume_path is None:
+            _log("RESUME", f"{mode} 未找到 {latest_ckpt}, 从头开始")
+    if resume_path:
+        start_ep = _resume_from(resume_path, model, opt, scheduler,
                                 history, prototypes_seq, device, total)
-        _log("RESUME", f"{mode} 从 {latest_ckpt} 恢复, 已完成 {start_ep} epoch, "
+        _log("RESUME", f"{mode} 从 {resume_path} 恢复, 已完成 {start_ep} epoch, "
                        f"num_steps={opt.num_steps}")
-    elif getattr(args, "resume", False):
-        _log("RESUME", f"{mode} 未找到 {latest_ckpt}, 从头开始")
 
     t0 = time.time()
 
@@ -1323,6 +1331,10 @@ def main():
                    help="用旧的 PIL 逐张解码数据管道 (慢, 仅用于对照)")
     p.add_argument("--resume", action="store_true",
                    help="从 {out}/checkpoints/{model}_{mode}_latest.pt 断点续训")
+    p.add_argument("--resume-from", default=None, dest="resume_from",
+                   metavar="PATH",
+                   help="从指定 ckpt 续训(优先于 --resume), 例如 warmup 结束的 "
+                        "resnet20_daco_ep15.pt; 改代码后复用已完成的前段用这个")
     p.add_argument("--ckpt-every", type=int, default=10, dest="ckpt_every",
                    help="每 N 个 epoch 额外存一份快照 (0=只存 latest, 默认 10)")
     p.add_argument("--modes", default="baseline,daco")

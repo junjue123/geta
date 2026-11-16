@@ -169,24 +169,35 @@ class DistillRuntime:
             return None, {}
 
         clean_pred = clean_logits.argmax(1).detach()
+        # P1 优化: G 个视图在 batch 维拼成一份, 一次前向一次反传后再按 G 切分。
+        # 之前逐视图前向要保留 G 张独立的前向图, 实测 joint 单步 1.95s(warmup 是
+        # 0.17s); 拼 batch 后图数从 ~10 降到 2, 是这笔开销的主要来源。
+        batch = X.size(0)
+        G = len(views)
+        xs = torch.cat([v for _, v in views], dim=0)         # [G*B, C, H, W]
+        with _bn_eval(self.model):
+            out_all = _logits(self.model(xs)).view(G, batch, -1)
+
+        if rw["teacher_agreement"] > 0 and self.pool.has_cf:
+            with torch.no_grad():
+                pred_cf_all = _logits(self.pool.cf(xs)).argmax(1).view(G, batch)
+        else:
+            pred_cf_all = None
+
         rewards = []
         logps = []
-        with _bn_eval(self.model):
-            for name, v in views:
-                out_s = _logits(self.model(v))
-                logp = F.log_softmax(out_s, dim=1)
-                logps.append(logp.gather(1, y.view(-1, 1)).squeeze(1))
-
-                r = torch.zeros_like(y, dtype=torch.float32)
-                if rw["correctness"]:
-                    r = r + (out_s.argmax(1) == y).float()
-                if rw["teacher_agreement"] > 0 and self.pool.has_cf:
-                    with torch.no_grad():
-                        pred_cf = _logits(self.pool.cf(v)).argmax(1)
-                    r = r + rw["teacher_agreement"] * (out_s.argmax(1) == pred_cf).float()
-                if rw["clean_consistency"] > 0:
-                    r = r + rw["clean_consistency"] * (out_s.argmax(1) == clean_pred).float()
-                rewards.append(r.detach())
+        for gi in range(G):
+            out_s = out_all[gi]
+            logps.append(F.log_softmax(out_s, dim=1).gather(
+                1, y.view(-1, 1)).squeeze(1))
+            r = torch.zeros_like(y, dtype=torch.float32)
+            if rw["correctness"]:
+                r = r + (out_s.argmax(1) == y).float()
+            if pred_cf_all is not None:
+                r = r + rw["teacher_agreement"] * (out_s.argmax(1) == pred_cf_all[gi]).float()
+            if rw["clean_consistency"] > 0:
+                r = r + rw["clean_consistency"] * (out_s.argmax(1) == clean_pred).float()
+            rewards.append(r.detach())
 
         R = torch.stack(rewards, dim=1)                     # [B, G]
         adv = R - R.mean(dim=1, keepdim=True)
@@ -247,8 +258,25 @@ class DistillRuntime:
 
         loss = None
         per = {}
+        kept = []          # [(name, 逐通道分布)], 用来查重
         for n in common:
             ps = self._chan_dist(feats_s[n])
+            # P0: 去重 tap。resnet20 是 layer3 -> avg_pool2d(8,8) -> linear, 而
+            # _chan_dist 对 4D 特征按空间均值降到逐通道分布, 于是
+            # avg_pool 的 tap 恰好等于 layer3 的空间均值(实测两者 KL 完全相同
+            # 0.1020/0.1020、0.0960/0.0960), 等于 layer3 被 alpha 计了两次。
+            dup = None
+            for m, ps_m in kept:
+                if ps.shape == ps_m.shape and torch.allclose(
+                        ps.detach(), ps_m.detach(), atol=1e-6, rtol=1e-4):
+                    dup = m
+                    break
+            if dup is not None:
+                self._warn_once(f"dup_{n}",
+                                f"tap '{n}' 与 '{dup}' 的逐通道分布完全相同, 已去重"
+                                f"(否则同一个量被 alpha 计两次); 建议从 feature.taps 删掉一个")
+                continue
+            kept.append((n, ps))
             with torch.no_grad():
                 pt = self._chan_dist(feats_t[n])
             if f["divergence"] == "forward":

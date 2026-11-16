@@ -198,6 +198,21 @@ def main():
     assert moved == 0, f"{moved} 个 BN 的 running_mean 被视图前向改写了"
     print(f"  [ok] step={rt_stub.step}, {len(bns)} 个 BN 统计未被额外前向改动")
 
+    print("\nT11 tap 去重: layer3 与 avg_pool 是同一个量, 只能计一次")
+    cfg_dup = DC.resolve({"enabled": True,
+                          "teacher": {"hist": {"enabled": True}, "cf": {"enabled": True}},
+                          "feature": {"enabled": True,
+                                      "taps": ["layer3", "avg_pool"]}})
+    rt_dup = DistillRuntime(cfg_dup, model, torch.nn.CrossEntropyLoss(),
+                            torch.device("cpu"), str(ROOT / "no_such_dir"),
+                            "resnet20", "daco",
+                            lambda: build_model("resnet20", torch.device("cpu"))[0])
+    rt_dup.pool.hist = [(1, model)]
+    rt_dup.feature_on = True
+    fl2, fs2 = rt_dup._feature_loss(X)
+    assert "feat_layer3" in fs2 and "feat_avg_pool" not in fs2, fs2
+    print(f"  [ok] 去重后只剩 {list(fs2.keys())}, 未把同一个量计两次")
+
     print("\n[ok] 运行时单元测试全部通过")
 
 
