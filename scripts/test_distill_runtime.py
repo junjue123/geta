@@ -54,18 +54,39 @@ def main():
     assert devs[0] < devs[1] < devs[2], devs
     print(f"  [ok] 三档逐项单调; color 实测偏离 {devs[0]:.4f} < {devs[1]:.4f} < {devs[2]:.4f}")
 
-    print("\nT4 教师池: 开着 T_hist 但没有历史 ckpt 时必须降级并留痕, 不能假装有教师")
+    print("\nT4 教师池: 开着 T_hist 但目录里没有 ckpt 时必须硬失败(不再静默降级成空教师池)")
     from train import build_model
     model, _ = build_model("resnet20", torch.device("cpu"))
+    try:
+        TeacherPool(
+            DC.resolve({"enabled": True,
+                        "teacher": {"hist": {"enabled": True}, "cf": {"enabled": True}}}),
+            model, str(ROOT / "no_such_dir"), "resnet20", "daco",
+            torch.device("cpu"),
+            lambda: build_model("resnet20", torch.device("cpu"))[0])
+    except RuntimeError as e:
+        assert "T_hist 无候选" in str(e), e
+        assert "resnet20_daco_ep*.pt" in str(e), e
+        print(f"  [ok] 报错并点名缺失前缀: {str(e)[:60]}...")
+    else:
+        raise AssertionError("空目录起教师池居然没报错, 会静默关掉软标签/特征锚/ref 位")
+
+    print("\nT4b 教师池: 候选能加载时正常建池, 且记住学生模型(准入判据拿它当参照)")
+    import tempfile
+    tmp = Path(tempfile.mkdtemp())
+    cdir = tmp / "checkpoints"
+    cdir.mkdir(parents=True)
+    torch.save(model.state_dict(), cdir / "resnet20_daco_ep3.pt")
     pool = TeacherPool(
         DC.resolve({"enabled": True,
-                    "teacher": {"hist": {"enabled": True}, "cf": {"enabled": True}}}),
-        model, str(ROOT / "no_such_dir"), "resnet20", "daco",
-        torch.device("cpu"),
+                    "teacher": {"hist": {"enabled": True, "max_count": 1},
+                                "cf": {"enabled": True}}}),
+        model, str(tmp), "resnet20", "daco", torch.device("cpu"),
         lambda: build_model("resnet20", torch.device("cpu"))[0])
-    assert not pool.has_hist and pool.has_cf
-    assert pool.notes and "T_hist 未建成" in pool.notes[0], pool.notes
-    print(f"  [ok] {pool.notes[0][:64]}...")
+    assert pool.has_hist and pool.has_cf
+    assert pool.model is model, "准入判据需要 self.model, 漏赋值会 AttributeError"
+    assert [e for e, _ in pool.hist] == [3], pool.hist
+    print(f"  [ok] 从 ep3 建池, has_hist={pool.has_hist}, has_cf={pool.has_cf}")
 
     print("\nT5 决策层损失: 奖励有差异时有限、可反传; 奖励全同则损失必须恰好为 0")
     cfg = DC.resolve({"enabled": True,
@@ -136,21 +157,43 @@ def main():
     assert after <= eps + 1e-5, f"投影后仍越界: {after} > {eps}"
     print(f"  [ok] {name}: 相对偏离 {before:.4f} -> {after:.4f} (ε={eps}) 统计={st}")
 
-    print("\nT7 特征层 KL: 前向/反向两种都有限, 且层名非法时不崩")
+    print("\nT7 特征层 KL: 前向/反向两种都有限, 且层名非法时当场报错")
     for div in ("forward", "reverse"):
         c2 = DC.resolve({"enabled": True,
                          "teacher": {"hist": {"enabled": True}, "cf": {"enabled": True}},
                          "feature": {"enabled": True, "taps": ["layer2", "avg_pool"],
                                      "divergence": div}})
-        # 没有历史 ckpt, 但为测 KL 本身, 手动塞一个教师进去
         rt2 = DistillRuntime(c2, model, torch.nn.CrossEntropyLoss(), torch.device("cpu"),
-                            str(ROOT / "no_such_dir"), "resnet20", "daco",
-                            lambda: build_model("resnet20", torch.device("cpu"))[0])
-        rt2.pool.hist = [(1, model)]
+                             str(tmp), "resnet20", "daco",
+                             lambda: build_model("resnet20", torch.device("cpu"))[0])
         rt2.feature_on = True
         fl, fs = rt2._feature_loss(X)
         assert fl is not None and torch.isfinite(fl), (div, fl)
         print(f"  [ok] {div}: loss={float(fl):.5f} {fs}")
+
+    # taps 写错了会被 _TapCapture 静默过滤 -> 特征层整项消失, 必须硬失败
+    # 两层校验各管一段: config 管"名字是否在合法集合里", runtime 管"当前模型上有没有这层"
+    # (resnet20 没有 layer4, 名字合法但取不到 -> 必须硬失败, 否则特征层被静默丢掉)
+    try:
+        DC.resolve({"enabled": True,
+                    "teacher": {"hist": {"enabled": True}},
+                    "feature": {"enabled": True, "taps": ["layr2"]}})
+    except DC.DistillConfigError as e:
+        assert "未知层" in str(e), e
+        print(f"  [ok] 拼错层名在 config 阶段就报错: {str(e)[:50]}...")
+
+    c4 = DC.resolve({"enabled": True,
+                     "teacher": {"hist": {"enabled": True}},
+                     "feature": {"enabled": True, "taps": ["layer4"]}})
+    try:
+        DistillRuntime(c4, model, torch.nn.CrossEntropyLoss(), torch.device("cpu"),
+                       str(tmp), "resnet20", "daco",
+                       lambda: build_model("resnet20", torch.device("cpu"))[0])
+    except RuntimeError as e:
+        assert "取不到的层" in str(e), e
+        print(f"  [ok] 模型上没有这层时报错: {str(e)[:50]}...")
+    else:
+        raise AssertionError("resnet20 没有 layer4, 却没报错")
 
     print("\nT9 CUDA 上生成视图(曾经因为 generator 在 CPU 上而直接崩)")
     if torch.cuda.is_available():
@@ -204,10 +247,9 @@ def main():
                           "feature": {"enabled": True,
                                       "taps": ["layer3", "avg_pool"]}})
     rt_dup = DistillRuntime(cfg_dup, model, torch.nn.CrossEntropyLoss(),
-                            torch.device("cpu"), str(ROOT / "no_such_dir"),
+                            torch.device("cpu"), str(tmp),
                             "resnet20", "daco",
                             lambda: build_model("resnet20", torch.device("cpu"))[0])
-    rt_dup.pool.hist = [(1, model)]
     rt_dup.feature_on = True
     fl2, fs2 = rt_dup._feature_loss(X)
     assert "feat_layer3" in fs2 and "feat_avg_pool" not in fs2, fs2

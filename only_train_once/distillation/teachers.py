@@ -100,6 +100,7 @@ class TeacherPool:
                  model_factory, log=None, val_loader=None):
         self.cfg = cfg
         self.device = device
+        self.model = model      # 学生; 准入判据要拿它当参照(此前漏赋值, 准入一开就 AttributeError)
         self.hist = []          # [(epoch, model)]
         self.cf = None
         self.notes = []
@@ -117,17 +118,27 @@ class TeacherPool:
         # 教师来源目录: 默认取本次 run 的 out_dir。跨目录(把"压缩前的起点模型"
         # 当教师)时由配置指定, 前缀里的 mode 也要跟着变。
         src_dir = hcfg.get("source_dir") or out_dir
-        cands = discover_hist_candidates(src_dir, model_name,
-                                         hcfg.get("source_mode") or mode)
+        src_mode = hcfg.get("source_mode") or mode
+        cands = discover_hist_candidates(src_dir, model_name, src_mode)
         if not cands:
-            self.notes.append(
-                f"T_hist 未建成: {src_dir}/checkpoints 下没有 "
-                f"{model_name}_{hcfg.get('source_mode') or mode}_ep*.pt; "
-                "依赖它的特征层与 ref 位本次运行会自动关闭")
-            self._log("DISTILL", self.notes[-1])
-            return
-
+            # 必须硬失败。没有教师时软标签/特征锚/ref 位会全部静默关闭, 训练照跑、
+            # 日志一切正常, 等于三项机制里的两项没开 —— 这种"实验白跑"比报错贵得多。
+            ckpt_dir = os.path.join(src_dir, "checkpoints")
+            near = []
+            if os.path.isdir(ckpt_dir):
+                near = sorted(f for f in os.listdir(ckpt_dir) if f.endswith(".pt"))[:8]
+            elif os.path.isdir(src_dir):
+                near = sorted(os.listdir(src_dir))[:8]
+            raise RuntimeError(
+                f"T_hist 无候选: 找不到 {ckpt_dir}/{model_name}_{src_mode}_ep*.pt。"
+                f" 该目录现有: {near or '目录不存在或为空'}。"
+                f" 检查 source_dir / source_mode(跨目录取教师时要写那边的 mode, "
+                f"例如 baseline) 与 ckpt 前缀是否对得上。")
         k = max(1, int(hcfg["max_count"]))
+        if len(cands) < k:
+            self._log("DISTILL",
+                      f"T_hist 候选只有 {len(cands)} 个, 少于 max_count={k}, "
+                      f"按实际 {len(cands)} 个取")
         picked = self._select(cands, k, hcfg["require_warmup_mid"],
                               hcfg.get("coordinate", "compression"),
                               hcfg.get("pick", "earliest"))
@@ -137,6 +148,10 @@ class TeacherPool:
                 self.hist.append((ep, m))
             except Exception as e:                      # 单个坏 ckpt 不该拖垮整次训练
                 self._log("DISTILL", f"教师 ep{ep} 加载失败, 跳过: {e}")
+        if not self.hist:
+            raise RuntimeError(
+                f"T_hist 候选 {len(cands)} 个但全部加载失败(见上面的 [DISTILL] 失败原因), "
+                "教师池为空会让软标签/特征锚/ref 位静默关闭。")
         if self.hist:
             delta = float(hcfg.get("admit_acc_delta", 0.0))
             # 准入判据: 教师精度不得低于学生太多。实测学生 ep15 val 49.57%,
@@ -160,11 +175,13 @@ class TeacherPool:
             eps = [e for e, _ in self.hist]
             if self.hist:
                 self.notes.append(f"T_hist 就绪: {len(self.hist)} 个(ep={eps})")
+                self._log("DISTILL", self.notes[-1])
             else:
-                self.notes.append(
-                    "T_hist 全部被准入判据拒绝(教师都比学生弱), 依赖它的特征层与 "
-                    "ref 位本次自动关闭")
-            self._log("DISTILL", self.notes[-1])
+                # 同样必须硬失败: 准入把教师全拒了, 后续特征层/ref 位会静默关闭。
+                raise RuntimeError(
+                    "T_hist 全部被准入判据拒绝: 每个候选教师都劣于学生 "
+                    f"(admit_acc_delta={delta})。要么把起点模型换成更强的快照, "
+                    "要么放宽 admit_acc_delta, 不要带着空教师池继续跑。")
 
     @staticmethod
     def _select(cands, k, require_mid, coordinate="compression", pick="earliest"):

@@ -106,6 +106,17 @@ class DistillRuntime:
         self.pool = TeacherPool(cfg, model, out_dir, model_name, mode, device,
                                 model_factory, log=self.log, val_loader=val_loader)
 
+        # 特征取点校验: 写成不存在的层名会被 _TapCapture 静默过滤掉, 特征层整项
+        # 就悄悄不生效了(实测 avp_pool 曾与 layer3 等价, 也是同类问题的变体)。
+        if cfg["feature"]["enabled"]:
+            bad = [n for n in cfg["feature"]["taps"]
+                   if n not in _TapCapture.SPEC
+                   or not hasattr(model, _TapCapture.SPEC[n][0])]
+            if bad:
+                raise RuntimeError(
+                    f"feature.taps 里有当前模型取不到的层: {bad}; "
+                    f"{model_name} 上可用的是 {sorted(_TapCapture.SPEC)}")
+
         # 参数层锚点: pre_compression = 挂载时刻(即 joint 段开始的压缩结构)
         self.anchor = {}
         if cfg["weight"]["enabled"]:

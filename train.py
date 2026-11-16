@@ -140,6 +140,26 @@ def flush_pending():
     _PENDING.clear()
 
 
+def _git_state():
+    """当前 commit 与是否有未提交改动; 拿不到就返回 None, 不因为 git 缺失拖垮训练。"""
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    out = {}
+    try:
+        out["commit"] = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=here,
+            stderr=subprocess.DEVNULL).decode().strip()
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=here,
+            stderr=subprocess.DEVNULL).decode().strip()
+        out["dirty"] = bool(dirty)
+        if dirty:
+            out["dirty_files"] = [ln[3:] for ln in dirty.splitlines()[:8]]
+    except Exception:
+        return None
+    return out
+
+
 def dump_run_config(args, path):
     """把本次运行的全部配置落一份 yaml, 保证任何一次实验都能回溯。"""
     try:
@@ -153,6 +173,7 @@ def dump_run_config(args, path):
             "paper_defaults": dict(sorted(PAPER_DEFAULTS.items())),
             "baseline_override": dict(sorted(BASELINE_OVERRIDE.items())),
             "distill": DISTILL_CFG,     # 第3章蒸馏开关组的最终生效值(None=未启用)
+            "git": _git_state(),        # 代码版本: 事后对不上 commit 的实验等于没有记录
         }
         d = os.path.dirname(os.path.abspath(path))
         if d:
@@ -967,6 +988,19 @@ def run_experiment(args, mode):
 
     # ---- 断点续训 ----
     ckpt_dir = os.path.join(args.out, "checkpoints")
+    # 覆盖保护: 同一个 out 目录里已经有 epoch 快照时不静默覆盖。
+    # 两个实验写同一个 out 会互相踩 ckpt 与 history.jsonl, 事后极难分辨。
+    if os.path.isdir(ckpt_dir):
+        existing = [f for f in os.listdir(ckpt_dir)
+                    if f.startswith(f"{args.model}_{mode}_ep")
+                    and f.endswith(".pt")]
+        do_resume = bool(getattr(args, "resume_from", None)
+                         or getattr(args, "resume", False))
+        if existing and not do_resume and not getattr(args, "overwrite", False):
+            raise SystemExit(
+                f"[CONFIG] out={args.out} 的 checkpoints/ 里已有 {len(existing)} 个 "
+                f"{args.model}_{mode}_ep*.pt (最新 {sorted(existing)[-1]})。\n"
+                f"  换一个 out, 或显式 --overwrite / --resume / --resume-from 后再跑。")
     os.makedirs(ckpt_dir, exist_ok=True)
     latest_ckpt = os.path.join(ckpt_dir, f"{args.model}_{mode}_latest.pt")
     start_ep = 0
@@ -1390,6 +1424,8 @@ def main():
                    help="用旧的 PIL 逐张解码数据管道 (慢, 仅用于对照)")
     p.add_argument("--resume", action="store_true",
                    help="从 {out}/checkpoints/{model}_{mode}_latest.pt 断点续训")
+    p.add_argument("--overwrite", action="store_true",
+                   help="允许向已含 epoch 快照的 out 目录继续写(默认拒绝, 防两个实验互相覆盖)")
     p.add_argument("--resume-from", default=None, dest="resume_from",
                    metavar="PATH",
                    help="从指定 ckpt 续训(优先于 --resume), 例如 warmup 结束的 "
