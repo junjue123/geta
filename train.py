@@ -185,6 +185,8 @@ PAPER_DEFAULTS = dict(
 
 # 第3章蒸馏开关组: 由 yaml 的 distill 块解析而来; None 表示本次运行不启用蒸馏
 DISTILL_CFG = None
+# 运行时实例: 真正执行三项损失/约束的对象; 只在 joint 段挂载
+DISTILL_RUNTIME = None
 
 
 # Baseline: 硬投影, 关闭 RCAJS 自适应 / MCSS / DGD
@@ -582,16 +584,27 @@ def configure_training_schedule(opt, warmup_epochs, joint_epochs, steps_per_epoc
 # ===========================================================================
 # 训练 / 验证
 # ===========================================================================
-def train_one_epoch(model, opt, loader, criterion, device, epoch, scheduler):
+def train_one_epoch(model, opt, loader, criterion, device, epoch, scheduler,
+                    runtime=None, progress=0.0):
+    """单个 epoch。runtime 只在 joint 段生效(压缩进行中才有"教师"可谈)。"""
     model.train()
     total_loss, correct, total = 0.0, 0, 0
     for bi, (X, y) in enumerate(loader):
         X, y = X.to(device), y.to(device)
         out = model(X)
         loss = criterion(out, y)
+        stats = {}
+        if runtime is not None:
+            # 三项里只有 decision/feature 是损失; weight 在 opt.step() 之后做投影。
+            extra, stats = runtime.extra_loss(X, y, out.detach())
+            if extra is not None:
+                loss = loss + extra
         opt.zero_grad()
         loss.backward()
         opt.step()
+        if runtime is not None:
+            # 必须在 step 之后: 先让优化器走一步, 再拉回 ε-球内, 顺序反了就等于没约束
+            stats.update(runtime.project_weights(progress))
         if scheduler is not None:
             scheduler.step()
         total_loss += loss.item() * X.size(0)
@@ -600,6 +613,10 @@ def train_one_epoch(model, opt, loader, criterion, device, epoch, scheduler):
         if bi % 100 == 0:
             print(f"    Ep{epoch} [{bi}/{len(loader)}] loss={loss.item():.4f} "
                   f"acc={correct/total:.4f}", flush=True)
+            if stats:
+                _log("DISTILL", f"ep{epoch} step{bi} " + " ".join(
+                    f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
+                    for k, v in stats.items()))
     return total_loss / total, correct / total
 
 
@@ -833,6 +850,7 @@ def _resume_from(path, model, opt, scheduler, history, prototypes_seq, device,
 
 
 def run_experiment(args, mode):
+    global DISTILL_RUNTIME
     set_seed(args.seed, args.deterministic)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"\n{'='*70}")
@@ -919,13 +937,31 @@ def run_experiment(args, mode):
 
     t0 = time.time()
 
+    runtime = None
+    runtime_ready = False
     for ep in range(start_ep, total):
         phase = ("warmup" if ep < warmup
                  else "joint" if ep < warmup + joint
                  else "cooldown")
+        # 蒸馏只在 daco 的 joint 段挂载:
+        #   baseline 必须保持纯 GETA 才能当对照;
+        #   warmup 段还没有"压缩轨迹上的教师", 硬挂等于凭空造教师。
+        if (DISTILL_CFG and DISTILL_CFG.get("enabled") and phase == "joint"
+                and mode != "baseline" and runtime is None):
+            from only_train_once.distillation.runtime import DistillRuntime
+            runtime = DistillRuntime(
+                DISTILL_CFG, model, criterion, device, args.out,
+                args.model, mode,
+                model_factory=lambda: build_model(
+                    args.model, device, quant_mode=args.quant_mode)[0],
+                log=_log)
+            DISTILL_RUNTIME = runtime
+            _log("DISTILL", f"运行时已挂载于 ep{ep + 1}(joint 起点, 参数锚点即此刻结构)")
         t_ep = time.time()
         tr_loss, tr_acc = train_one_epoch(
-            model, opt, trainloader, criterion, device, ep+1, scheduler)
+            model, opt, trainloader, criterion, device, ep+1, scheduler,
+            runtime=runtime,
+            progress=min(1.0, (ep - warmup + 1) / max(joint, 1)) if joint else 0.0)
         if phase == "joint" and mode != "baseline" and hasattr(opt, "rcajs"):
             wt_hit, act_hit = rcajs_phi_scheduler(
                 opt, cfg["phi_b_threshold"],

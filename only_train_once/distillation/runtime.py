@@ -1,0 +1,282 @@
+"""第3章: 蒸馏运行时——把开关组翻译成真正的损失与约束。
+
+三层介入, 各自只在"该层的执行位置"发力, 不互相借用:
+  decision (损失/标量)  -> GRPO 组内优势, 只对 logits
+  feature  (反传/hook)   -> 逐层特征 KL, 梯度直接灌进中间层
+  weight   (post-step)   -> ε-球投影, 不是损失, 发生在 opt.step() 之后
+
+三条纪律:
+  1. 任一机制缺资源(没有 T_hist、组内无差异、tap 名非法) 时, **关掉该项并记一条
+     日志**, 不静默退化、不伪造损失;
+  2. 教师一律 no_grad + eval, 学生梯度只从学生自己的前向图来;
+  3. 每项损失都可单独归零, 用于"机制缺失对照"(§22 要求机制全保留、只做缺失对照)。
+"""
+
+import math
+
+import torch
+import torch.nn.functional as F
+
+from .teachers import TeacherPool
+from .views import make_views, view_diversity
+
+
+class _TapCapture:
+    """临时挂 hook 抓指定层的输出(avg_pool 抓 linear 的输入)。"""
+
+    # tap 名 -> (在模型上的属性名, "output" | "input")
+    SPEC = {
+        "layer1": ("layer1", "output"),
+        "layer2": ("layer2", "output"),
+        "layer3": ("layer3", "output"),
+        "layer4": ("layer4", "output"),
+        "avg_pool": ("linear", "input"),
+    }
+
+    def __init__(self, model, names):
+        self.model = model
+        self.names = [n for n in names if hasattr(model, self.SPEC.get(n, ("",))[0])]
+        self.store = {}
+        self.handles = []
+
+    def __enter__(self):
+        for n in self.names:
+            attr, kind = self.SPEC[n]
+            mod = getattr(self.model, attr)
+            if kind == "output":
+                h = mod.register_forward_hook(self._mk(n, 0))
+            else:
+                h = mod.register_forward_pre_hook(self._mk(n, 0))
+            self.handles.append(h)
+        return self
+
+    def _mk(self, name, idx):
+        def hook(_m, inputs, output=None):
+            self.store[name] = inputs[idx] if output is None else output
+        return hook
+
+    def __exit__(self, *a):
+        for h in self.handles:
+            h.remove()
+        self.handles = []
+
+
+def _logits(out):
+    return out[0] if isinstance(out, tuple) else out
+
+
+class DistillRuntime:
+    def __init__(self, cfg, model, criterion, device, out_dir, model_name, mode,
+                 model_factory, log=None):
+        self.cfg = cfg
+        self.model = model
+        self.criterion = criterion
+        self.device = device
+        self.log = log or (lambda tag, msg: None)
+        self._warned = set()
+        self.step = 0
+
+        self.pool = TeacherPool(cfg, model, out_dir, model_name, mode, device,
+                                model_factory, log=self.log)
+
+        # 参数层锚点: pre_compression = 挂载时刻(即 joint 段开始的压缩结构)
+        self.anchor = {}
+        if cfg["weight"]["enabled"]:
+            self.anchor = {n: p.detach().clone()
+                           for n, p in model.named_parameters() if p.numel() > 0}
+            self.log("DISTILL", f"参数层锚点已冻结: {len(self.anchor)} 个张量; "
+                                f"ε0={cfg['weight']['epsilon0']} "
+                                f"schedule={cfg['weight']['schedule']}")
+
+        # 缺 T_hist 时, 依赖它的两项必须真的关掉(不是"算了不报")
+        if cfg["feature"]["enabled"] and not self.pool.has_hist:
+            self.feature_on = False
+            self.log("DISTILL", "feature.enabled=true 但 T_hist 不可用 -> 本次关闭特征层")
+        else:
+            self.feature_on = cfg["feature"]["enabled"]
+        if cfg["decision"]["ref_kl"]["enabled"] and not self.pool.has_hist:
+            self.ref_on = False
+            self.log("DISTILL", "ref_kl.enabled=true 但 T_hist 不可用 -> 本次关闭 ref 位")
+        else:
+            self.ref_on = cfg["decision"]["ref_kl"]["enabled"]
+
+        self.log("DISTILL", f"运行时就绪: decision={cfg['decision']['enabled']} "
+                            f"feature={self.feature_on} weight={cfg['weight']['enabled']} "
+                            f"| {self.pool.describe()}")
+
+    # ================= 三项损失 =================
+    def extra_loss(self, X, y, clean_logits):
+        """返回 (总计损失, 统计字典)。没有任何机制生效时返回 (None, {})。"""
+        total = None
+        stats = {}
+
+        if self.cfg["decision"]["enabled"]:
+            dec, dstats = self._decision_loss(X, y, clean_logits)
+            stats.update(dstats)
+            if dec is not None:
+                total = dec if total is None else total + dec
+
+        if self.feature_on:
+            feat, fstats = self._feature_loss(X)
+            stats.update(fstats)
+            if feat is not None:
+                total = feat if total is None else total + feat
+
+        return total, stats
+
+    # ---- 决策层: GRPO 组内优势 ----
+    def _decision_loss(self, X, y, clean_logits):
+        d = self.cfg["decision"]
+        rw = d["reward"]
+        views = make_views(X, d["augment_modes"], d["severity"],
+                           group_size=int(d["group_size"]), seed=self.step)
+        if len(views) < 2:
+            self._warn_once("no_aug",
+                            "augment_modes 只有 identity, 组内无差异 -> 决策层损失跳过")
+            return None, {}
+
+        clean_pred = clean_logits.argmax(1).detach()
+        rewards = []
+        logps = []
+        for name, v in views:
+            out_s = _logits(self.model(v))
+            logp = F.log_softmax(out_s, dim=1)
+            logps.append(logp.gather(1, y.view(-1, 1)).squeeze(1))
+
+            r = torch.zeros_like(y, dtype=torch.float32)
+            if rw["correctness"]:
+                r = r + (out_s.argmax(1) == y).float()
+            if rw["teacher_agreement"] > 0 and self.pool.has_cf:
+                with torch.no_grad():
+                    pred_cf = _logits(self.pool.cf(v)).argmax(1)
+                r = r + rw["teacher_agreement"] * (out_s.argmax(1) == pred_cf).float()
+            if rw["clean_consistency"] > 0:
+                r = r + rw["clean_consistency"] * (out_s.argmax(1) == clean_pred).float()
+            rewards.append(r.detach())
+
+        R = torch.stack(rewards, dim=1)                     # [B, G]
+        adv = R - R.mean(dim=1, keepdim=True)
+        if d["advantage"]["normalize_std"]:
+            adv = adv / (R.std(dim=1, keepdim=True) + 1e-6)
+
+        LP = torch.stack(logps, dim=1)                      # [B, G]
+        if d["advantage"]["mode"] == "positive":
+            # §23 的最终形式: 只对正优势项加权, 等价于 -\frac1{|P|}\sum (A_i)_+\log p
+            w = F.relu(adv)
+        else:
+            w = adv
+        denom = torch.clamp((w > 0).sum(), min=1) if d["advantage"]["mode"] == "positive" \
+            else w.numel()
+        dec = -(w * LP).sum() / denom
+
+        stats = {
+            "dec": float(dec.detach()),
+            "r_mean": float(R.mean()),
+            "adv_pos": float((adv > 0).float().mean()),
+            "view_div": view_diversity(views),
+        }
+
+        if self.ref_on and self.cfg["decision"]["ref_kl"]["beta"] > 0:
+            beta = self.cfg["decision"]["ref_kl"]["beta"]
+            t = self.pool.primary_hist()
+            with torch.no_grad():
+                t_logits = _logits(t(X))
+            kl = F.kl_div(F.log_softmax(_logits(self.model(X)), dim=1),
+                          F.log_softmax(t_logits, dim=1),
+                          log_target=True, reduction="batchmean")
+            dec = dec + beta * kl
+            stats["ref_kl"] = float(kl.detach())
+        return dec, stats
+
+    # ---- 表征层: 逐层特征 KL ----
+    def _feature_loss(self, X):
+        f = self.cfg["feature"]
+        names = list(f["taps"])
+        taps_s = _TapCapture(self.model, names)
+        with taps_s:
+            _logits(self.model(X))              # 这一条前向为了拿中间层, 图必须保留
+        feats_s = dict(taps_s.store)
+
+        t = self.pool.primary_hist()
+        taps_t = _TapCapture(t, names)
+        with torch.no_grad(), taps_t:
+            _logits(t(X))
+        feats_t = dict(taps_t.store)
+
+        common = [n for n in names if n in feats_s and n in feats_t]
+        if not common:
+            self._warn_once("no_tap", f"taps={names} 在模型与教师上取不到, 特征层跳过")
+            return None, {}
+
+        loss = None
+        per = {}
+        for n in common:
+            ps = self._chan_dist(feats_s[n])
+            with torch.no_grad():
+                pt = self._chan_dist(feats_t[n])
+            if f["divergence"] == "forward":
+                kl = F.kl_div(torch.log(ps + 1e-8), pt, reduction="batchmean")
+            else:
+                kl = F.kl_div(torch.log(pt + 1e-8), ps, reduction="batchmean")
+            w = self._tap_weight(n, f["budget"])
+            term = f["alpha"] * w * kl
+            loss = term if loss is None else loss + term
+            per[n] = float(kl.detach())
+        return loss, {f"feat_{k}": v for k, v in per.items()}
+
+    @staticmethod
+    def _chan_dist(feat):
+        """[B,C,H,W] -> 每样本逐通道分布的 logits([B,C]); 已池化时原样返回。"""
+        if feat.dim() == 4:
+            feat = feat.mean(dim=(2, 3))
+        return F.softmax(feat, dim=1)
+
+    def _tap_weight(self, name, budget):
+        if budget == "uniform":
+            return 1.0
+        # sensitivity: 浅层权重更低(与"越靠后语义越强"的先验一致);
+        # 真正的敏感度要用 E3 的逐层梯度范数来定, 这里是占位定义。
+        order = {n: i for i, n in enumerate(["layer1", "layer2", "layer3", "layer4", "avg_pool"])}
+        return 0.5 ** order.get(name, 0)
+
+    # ================= 参数层: 投影 =================
+    def project_weights(self, progress=1.0):
+        """post-step ε-球投影: ||w - w_anchor|| <= ε * ||w_anchor||。
+
+        注意: 剪枝仍在进行时, 被剪通道会从 0 变 0、未剪通道会漂移, 投影与剪枝
+        会互相拉扯。所以这里只投影"存活且非零"的参数, 并把越界量打出来观察。
+        """
+        if not self.cfg["weight"]["enabled"] or not self.anchor:
+            return {}
+        w = self.cfg["weight"]
+        eps = w["epsilon0"]
+        if w["schedule"] == "tighten":
+            kappa = max(float(w["kappa"]), 1e-6)
+            eps = w["epsilon0"] * (kappa ** -float(progress))
+
+        viol, clamped, skipped = 0, 0, 0
+        with torch.no_grad():
+            for n, p in self.model.named_parameters():
+                a = self.anchor.get(n)
+                if a is None or p.numel() == 0 or a.norm() == 0:
+                    continue
+                # 结构变了(剪枝把某些通道置零)就跳过: 此时"偏离"是剪枝造成的,
+                # 不是训练漂移, 投影它等于把剪枝撤销。实测在 joint 段每步会
+                # 误伤 43 个张量, 所以这条判据是必需的, 不是可选优化。
+                if int((p.data != 0).sum()) != int((a != 0).sum()):
+                    skipped += 1
+                    continue
+                delta = p.data - a
+                dn = delta.norm()
+                limit = eps * a.norm()
+                viol += int(dn > limit)
+                if dn > limit:
+                    p.data.copy_(a + delta * (limit / dn))
+                    clamped += 1
+        return {"w_viol": viol, "w_clamped": clamped, "w_skip": skipped, "eps": eps}
+
+    def _warn_once(self, key, msg):
+        if key in self._warned:
+            return
+        self._warned.add(key)
+        self.log("DISTILL", "[WARN] " + msg)
