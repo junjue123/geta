@@ -18,23 +18,6 @@ class NanInGradientError(Exception):
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 权重侧量化结果的 step 内缓存
-# ---------------------------------------------------------------------------
-# 权重在一个优化器 step 内是不变的, 但每一步里可能前向多次(主前向 + 蒸馏的 G 个
-# 增广视图), 每次都把同一份权重重新量化一遍, 等于白算 20 层 × 十几个逐元素 kernel。
-# 训练循环在 opt.step() 之后调用 mark_quant_step(), 缓存随 token 失效。
-_QUANT_STEP_TOKEN = [0]
-
-
-def mark_quant_step():
-    """优化器 step 结束后调用: 让所有量化层的权重缓存失效。"""
-    _QUANT_STEP_TOKEN[0] += 1
-
-
-def quant_step_token():
-    return _QUANT_STEP_TOKEN[0]
-
-# ---------------------------------------------------------------------------
 # NaN / Inf 处理策略
 # ---------------------------------------------------------------------------
 # 背景: 量化参数 (d_quant/q_m/t_quant) 的梯度是对整个 tensor 求和, 量级天然
@@ -478,19 +461,6 @@ class QuantizeMixin:
         self.register_buffer("_q_s_zero", torch.zeros((), dtype=torch.float32), persistent=False)
 
     def quantize_weight(self, weight: torch.tensor) -> torch.Tensor:
-        """Quantize the weight tensor (带 step 内缓存)。"""
-        # 同一 step 内 self.weight 与 d_quant/q_m/t_quant 都不变, 主前向与增广视图
-        # 前向可以复用同一份量化权重; 直接复用那张计算图, 梯度会照常累加到同一节点。
-        cache = self.__dict__.get("_wq_cache")
-        if (cache is not None and self.__dict__.get("_wq_token") == quant_step_token()
-                and cache[0] == torch.is_grad_enabled()):
-            return cache[1]
-        q = self._quantize_weight_raw(weight)
-        self.__dict__["_wq_cache"] = (torch.is_grad_enabled(), q)
-        self.__dict__["_wq_token"] = quant_step_token()
-        return q
-
-    def _quantize_weight_raw(self, weight: torch.tensor) -> torch.Tensor:
         """Quantize the weight tensor."""
         # 性能: 复用 buffer, 不再每层每步 torch.tensor(...) 做 H2D 拷贝
         weight_clip_val = self._weight_clip_t
