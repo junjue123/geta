@@ -1255,8 +1255,29 @@ def _apply_config(p):
         p.error(f"配置文件不存在: {cfg_path}")
     try:
         import yaml
+        # PyYAML 默认允许重复键(后一个静默覆盖前一个)。实测踩过: 生成配置时把
+        # `warmup_epochs: 0` 误写成 `epochs: 0`, 于是 epochs 被覆盖成 0 而没有报错。
+        # 这里用严格一点的 loader, 重复键直接失败。
+        class _StrictLoader(yaml.SafeLoader):
+            pass
+
+        def _construct_mapping(loader, node, deep=False):
+            mapping = {}
+            for key_node, value_node in node.value:
+                key = loader.construct_object(key_node, deep=deep)
+                if key in mapping:
+                    raise yaml.constructor.ConstructorError(
+                        "while constructing a mapping", node.start_mark,
+                        f"发现重复键 '{key}'", key_node.start_mark)
+                mapping[key] = loader.construct_object(value_node, deep=deep)
+            return mapping
+
+        _StrictLoader.add_constructor(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _construct_mapping)
         with open(cfg_path, encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
+            cfg = yaml.load(f, Loader=_StrictLoader) or {}
+    except yaml.constructor.ConstructorError as e:      # noqa: F821  (yaml 在上面才导入)
+        p.error(f"配置文件 {cfg_path} 有重复键, 后一个会静默覆盖前一个: {e}")
     except Exception as e:  # noqa: BLE001
         p.error(f"解析配置文件失败 {cfg_path}: {e}")
 

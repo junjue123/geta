@@ -6,8 +6,8 @@
 #     所以 joint 段学生被剪掉 40% 之后, 教师确实比学生强 —— 这才是
 #     "压缩更少、更可靠" 的教师应该来自哪里(先前取热身早期快照, 只有 43%).
 #
-# 用法: python train.py configs/distill_from100.yaml \
-#         --resume-from outputs/warmup_40/checkpoints/resnet20_baseline_ep40.pt
+# 用法: python train.py configs/distill_from40.yaml
+#   (权重来源写在 init_from: 只灌权重, epoch 从 0 重数, 8 期压缩调度从头开始)
 
 model: resnet20
 modes: daco
@@ -15,8 +15,7 @@ quant_mode: weight_and_activation
 
 init_from: outputs/warmup_40/checkpoints/resnet20_baseline_ep40.pt
 epochs: 8              # joint; 本地 4060 上约 70 min, 够看机制是否在工作
-warmup_init_from: outputs/warmup_40/checkpoints/resnet20_baseline_ep40.pt
-epochs: 0
+warmup_epochs: 0
 seed: 1
 deterministic: false
 lr: 0.001
