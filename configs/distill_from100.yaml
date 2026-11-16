@@ -13,7 +13,7 @@ model: resnet20
 modes: daco
 quant_mode: weight_and_activation
 
-epochs: 40             # joint; 每 epoch 只压 1.25 pt 稀疏, 对齐第2章的尺度
+epochs: 15             # joint; 只为验证蒸馏方法, 不追第2章的 100 epoch 规模
 warmup_epochs: 0
 seed: 1
 deterministic: false
@@ -60,7 +60,7 @@ logging:
   level: info
 
 compression:
-  target_group_sparsity: 0.5
+  target_group_sparsity: 0.3   # 压到 50% 时 5~10 期就塌成随机, 先压到 30% 保证学生还活着
   bit_reduction: 1
   min_bit_wt: 4
   max_bit_wt: 16
@@ -69,7 +69,7 @@ compression:
   phi_b_threshold: 0.9
   phi_a_threshold: 0.9
   kappa: 0.5
-  W: 40                  # 40 期, 每期 5~7 组(第2章 100 epoch 是 85 期)
+  W: 15                  # 15 期, 每期约 4 组
   beta_p: 1.0
 
 distill:
